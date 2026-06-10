@@ -68,6 +68,9 @@ BATCH = int(os.environ.get("BATCH_SIZE", "8"))
 BASE_SAMPLES = int(os.environ.get("BASE_SAMPLES", "4000"))
 SAVE_EVERY = int(os.environ.get("SAVE_EVERY", "25"))   # steps between ckpts
 TRAIN_ENABLED = os.environ.get("TRAIN", "1") == "1"
+# how long the SIGTERM handler waits for the training thread to finish a step
+UPDATE_GRACE_MARGIN = int(os.environ.get("UPDATE_GRACE_MARGIN", "30"))
+UPDATER_STATUS_PATH = os.path.join(DATA_DIR, "updater.json")
 
 LABELS = {0: "HUMAN", 1: "AI-GENERATED"}
 
@@ -198,8 +201,14 @@ class RealtimeTrainer:
     def _load_base_data(self):
         """Load a capped slice of the public datasets for continual training."""
         try:
-            from dataset import load_human_ai
-            ds = load_human_ai(max_samples=BASE_SAMPLES, preprocess=True)
+            from dataset import load_human_ai, DATASET_SPECS
+            # stream only ~enough per source to fill BASE_SAMPLES after shuffle,
+            # so startup stays light on a 2-vCPU / 16 GB Space.
+            n_specs = max(1, len(DATASET_SPECS))
+            per = int(os.environ.get(
+                "DATASET_PER_CAP", str(max(200, (BASE_SAMPLES // n_specs) * 2))))
+            ds = load_human_ai(max_samples=BASE_SAMPLES, per_dataset=per,
+                               preprocess=True)
             for r in ds:
                 self.base[int(r["label"])].append(r["text"])
             self._log(f"base dataset: human={len(self.base[0])}, "
@@ -392,6 +401,19 @@ def build_ui(trainer: RealtimeTrainer):
             f"| uptime | {up/60:.1f} min |\n"
             f"| storage | `{s['data_dir']}` |\n"
         )
+        # auto-update status written by app.py supervisor
+        try:
+            if os.path.exists(UPDATER_STATUS_PATH):
+                with open(UPDATER_STATUS_PATH) as f:
+                    u = json.load(f)
+                age = (time.time() - u.get("last_check", time.time())) / 60
+                upd = "🔄 updating…" if u.get("updating") else "✅ up to date"
+                md += (f"| github | {upd} |\n"
+                       f"| local rev | `{(u.get('local_sha') or '')[:7]}` |\n"
+                       f"| remote rev | `{(u.get('remote_sha') or '')[:7]}` |\n"
+                       f"| last update check | {age:.1f} min ago |\n")
+        except Exception:
+            pass
         import pandas as pd
         hist = list(trainer.loss_hist)
         df = pd.DataFrame(hist, columns=["step", "loss"]) if hist else \
@@ -449,6 +471,29 @@ def main():
     print(f"[main] data dir = {DATA_DIR}  preset = {PRESET}")
     trainer = RealtimeTrainer()
     trainer.start()
+
+    # Graceful shutdown for the app.py auto-updater: pause training, write a
+    # final checkpoint, then exit so the supervisor can pull + restart.
+    import signal
+
+    def _graceful(signum, frame):
+        try:
+            trainer._log(f"signal {signum}: pausing & checkpointing before exit")
+            trainer.state["status"] = "pausing for update"
+            trainer.stop()
+            if trainer.thread:
+                trainer.thread.join(timeout=max(5, UPDATE_GRACE_MARGIN))
+            trainer._save_ckpt()
+            trainer._log("checkpoint saved; exiting for update")
+        finally:
+            os._exit(0)
+
+    for _sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(_sig, _graceful)
+        except Exception:
+            pass
+
     demo = build_ui(trainer)
     port = int(os.environ.get("PORT", "7860"))
     kw = dict(server_name="0.0.0.0", server_port=port)

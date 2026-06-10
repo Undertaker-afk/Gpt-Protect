@@ -44,10 +44,20 @@ python config.py        # prints param counts for each preset
 
 ## Datasets
 
-* [`alex-kudryashov/dlr-hw-2-human-ai-texts`](https://huggingface.co/datasets/alex-kudryashov/dlr-hw-2-human-ai-texts) — labeled human/AI (500/500)
-* [`nbroad/basic_text_dataset`](https://huggingface.co/datasets/nbroad/basic_text_dataset) — human text (label = human)
+`dataset.py` unifies many human-vs-AI corpora (streamed, per-source capped) into
+one labeled stream (`0=human, 1=ai`):
 
-The corpus is human-heavy, so the trainer samples **label-balanced** batches.
+* `alex-kudryashov/dlr-hw-2-human-ai-texts`
+* `nbroad/basic_text_dataset` (human)
+* `mehddii/ai-text-detector-v2`
+* `AlekseyKorshuk/ai-text-classification`
+* `ziq/ai-generated-text-classification`
+* `NabeelShar/ai_and_human_text`
+* `akoukas/AITextDetectionDataset`
+* `dmitva/human_ai_generated_text` (paired columns → 2 rows each)
+
+Add more by appending to `DATASET_SPECS`. The corpus is human-heavy, so the
+realtime trainer samples **label-balanced** batches.
 
 ## Train
 
