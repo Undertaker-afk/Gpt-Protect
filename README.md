@@ -11,6 +11,7 @@ Google's **TurboQuant** efficient, adapted to a text classifier:
 | **mHC** — manifold HyperConnections (multi-stream residuals) for deep-MoE stability | residuals | `moe.py`, `architecture.py` |
 | **TurboQuant** — 3-bit KV cache (PolarQuant + QJL JL-sketch), plug-and-play | inference cache | `quant.py` |
 | **Muon** optimizer (Newton–Schulz orthogonalized momentum) for matrices, AdamW for the rest | training | `muon.py` |
+| **AI-pattern engine** (burstiness, perplexity proxy, repetition, AI-tell lexicon, …) fused into the classifier + heuristic score | features | `ai_patterns.py` |
 
 ## Files
 
@@ -84,8 +85,21 @@ See [`SPACE_README.md`](SPACE_README.md) for Space setup. On free CPU hardware
 use `MODEL_PRESET=tiny`.
 
 ### UI
-* **🔍 Detect** — paste text → HUMAN/AI verdict + confidence + stylometric features; label it to train the model live.
-* **📈 Dashboard** — live step / loss / accuracy / samples + loss curve (auto-refresh).
+* **🔍 Detect** — paste text → HUMAN/AI verdict, confidence, **neural vs. heuristic
+  AI-score agreement**, top contributing AI signals, and a full pattern/stylometry
+  breakdown; label it to train the model live.
+* **📈 Dashboard** — live step / loss / accuracy / throughput / precision-recall-F1,
+  **loss & accuracy curves**, **training-pool composition** and **confusion tallies**
+  bar charts, plus a **"Check GitHub for update now"** button (forces the auto-updater
+  to check immediately instead of waiting 20 min).
+
+### Intelligent AI-pattern detection (`ai_patterns.py`)
+24 hand-engineered signals (burstiness, sentence-length uniformity, type-token /
+hapax ratios, n-gram repetition, word/char entropy as a perplexity proxy,
+punctuation & contraction habits, an "AI-tell" lexicon, sentence-starter
+diversity, …). They are **fused into the model** (projected + concatenated with the
+pooled transformer features) so it has strong priors from step 0, and also power a
+transparent `heuristic_ai_score` shown alongside the neural prediction.
 
 ## Notes & honesty
 

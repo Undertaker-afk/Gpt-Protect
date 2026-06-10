@@ -42,7 +42,10 @@ UPDATE_INTERVAL = int(os.environ.get("UPDATE_INTERVAL_SEC", "1200"))   # 20 min
 UPDATE_GRACE = int(os.environ.get("UPDATE_GRACE_SEC", "150"))
 SUPERVISE_TICK = int(os.environ.get("SUPERVISE_TICK_SEC", "30"))
 REQS_HASH_FILE = os.path.join(_BASE, ".gptp_reqs_hash")
-STATUS_FILE = os.path.join(_DATA if os.path.isdir(_DATA) else _BASE, "updater.json")
+_STATUS_DIR = _DATA if os.path.isdir(_DATA) else _BASE
+STATUS_FILE = os.path.join(_STATUS_DIR, "updater.json")
+# the UI ("Check for update now" button) touches this file to force a check
+FORCE_FLAG = os.path.join(_STATUS_DIR, "force_update")
 
 
 def log(msg):
@@ -172,8 +175,18 @@ def supervise():
             log(f"main.py exited rc={proc.returncode}; relaunching")
             proc = launch_main()
 
-        # periodic update check
-        if time.time() - last_check >= UPDATE_INTERVAL:
+        # forced update check (UI button touches FORCE_FLAG)
+        forced = False
+        if os.path.exists(FORCE_FLAG):
+            try:
+                os.remove(FORCE_FLAG)
+            except Exception:
+                pass
+            forced = True
+            log("force-update requested via UI")
+
+        # periodic or forced update check
+        if forced or time.time() - last_check >= UPDATE_INTERVAL:
             last_check = time.time()
             try:
                 local, remote, differs = local_remote_diff()

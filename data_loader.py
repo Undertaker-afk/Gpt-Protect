@@ -13,6 +13,7 @@ import torch
 from torch.utils.data import Dataset as TorchDataset, DataLoader
 
 from augmentation import Augmenter
+from ai_patterns import feature_vector, N_FEATURES
 
 
 def get_tokenizer(name: str = "gpt2"):
@@ -58,6 +59,7 @@ class TextClsDataset(TorchDataset):
             "input_ids": torch.tensor(enc["input_ids"], dtype=torch.long),
             "attention_mask": torch.tensor(enc["attention_mask"], dtype=torch.long),
             "label": torch.tensor(int(row["label"]), dtype=torch.long),
+            "pattern_feats": torch.tensor(feature_vector(text), dtype=torch.float),
         }
 
 
@@ -75,6 +77,7 @@ def make_collate(pad_id: int):
             "input_ids": torch.stack(ids),
             "attention_mask": torch.stack(masks),
             "labels": torch.stack(labels),
+            "pattern_feats": torch.stack([b["pattern_feats"] for b in batch]),
         }
     return collate
 

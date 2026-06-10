@@ -82,11 +82,18 @@ local/remote commit and update status.
 
 ## UI
 
-* **🔍 Detect** — paste text → HUMAN/AI verdict, confidence, and a stylometric
-  breakdown. Use the *HUMAN* / *AI* buttons to label the sample; it is saved to
-  `/data/collected.jsonl` and folded into training immediately.
-* **📈 Training dashboard** — live step / loss / accuracy / samples, a loss
-  curve, and a recent-events log (auto-refresh every 3 s).
+* **🔍 Detect** — paste text → HUMAN/AI verdict, confidence, the **neural vs.
+  heuristic AI-score** (and whether they agree), the **top AI signals**, and a
+  full pattern/stylometry breakdown. Use the *HUMAN* / *AI* buttons to label the
+  sample; it is saved to `/data/collected.jsonl` and folded into training at once.
+* **📈 Training dashboard** — live step / loss / accuracy / throughput /
+  precision-recall-F1, **loss & accuracy curves**, **pool-composition** and
+  **confusion** bar charts, a recent-events log (auto-refresh every 3 s), and a
+  **"Check GitHub for update now"** button that forces an immediate update check.
+
+The model has an **intelligent AI-pattern engine** (`ai_patterns.py`) fused into
+it — 24 signals (burstiness, perplexity proxy, repetition, AI-tell lexicon, …) —
+so detection is strong even early in training.
 
 ## Persistence layout (`/data`)
 
