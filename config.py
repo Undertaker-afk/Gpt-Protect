@@ -44,6 +44,9 @@ class ModelConfig:
     num_labels: int = 2                # 0 = human, 1 = ai
     pool: str = "attn"                 # {"mean","cls","attn"}
 
+    # --- intelligent AI-pattern feature pathway (ai_patterns.py) --------- #
+    use_pattern_features: bool = True  # fuse hand-engineered AI-detection feats
+
     # --- MoE -------------------------------------------------------------- #
     use_moe: bool = True
     moe_every: int = 2                 # every Nth block is an MoE block

@@ -13,6 +13,7 @@ import torch.nn.functional as F
 
 from architecture import Backbone, RMSNorm
 from config import ModelConfig
+from ai_patterns import N_FEATURES
 
 
 class AttentionPool(nn.Module):
@@ -39,6 +40,18 @@ class AITextDetector(nn.Module):
         self.pool_mode = cfg.pool
         if cfg.pool == "attn":
             self.pool = AttentionPool(cfg.d_model)
+        # intelligent AI-pattern feature pathway: project hand-engineered
+        # signals and fuse them with the pooled transformer representation.
+        self.use_patterns = getattr(cfg, "use_pattern_features", True)
+        if self.use_patterns:
+            self.pattern_norm = nn.LayerNorm(N_FEATURES)
+            self.pattern_mlp = nn.Sequential(
+                nn.Linear(N_FEATURES, cfg.d_model),
+                nn.GELU(),
+                nn.Linear(cfg.d_model, cfg.d_model),
+            )
+            self.fuse = nn.Linear(2 * cfg.d_model, cfg.d_model)
+
         self.head_norm = RMSNorm(cfg.d_model, cfg.rms_eps)
         self.dropout = nn.Dropout(cfg.dropout)
         self.classifier = nn.Linear(cfg.d_model, cfg.num_labels)
@@ -62,9 +75,16 @@ class AITextDetector(nn.Module):
             return h[:, 0]
         return self.pool(h, mask)
 
-    def forward(self, input_ids, attention_mask=None, labels=None):
+    def forward(self, input_ids, attention_mask=None, labels=None,
+                pattern_feats=None):
         h, aux = self.backbone(input_ids, attention_mask)
         pooled = self._pool(h, attention_mask)
+        if self.use_patterns:
+            if pattern_feats is None:
+                pattern_feats = torch.zeros(pooled.size(0), N_FEATURES,
+                                            device=pooled.device, dtype=pooled.dtype)
+            pr = self.pattern_mlp(self.pattern_norm(pattern_feats))
+            pooled = self.fuse(torch.cat([pooled, pr], dim=-1))
         pooled = self.dropout(self.head_norm(pooled))
         logits = self.classifier(pooled)
 
@@ -77,9 +97,10 @@ class AITextDetector(nn.Module):
         return {"logits": logits, "loss": loss, "aux_loss": aux}
 
     @torch.no_grad()
-    def predict_proba(self, input_ids, attention_mask=None):
+    def predict_proba(self, input_ids, attention_mask=None, pattern_feats=None):
         self.eval()
-        logits = self.forward(input_ids, attention_mask)["logits"]
+        logits = self.forward(input_ids, attention_mask,
+                              pattern_feats=pattern_feats)["logits"]
         return F.softmax(logits, dim=-1)
 
     def num_parameters(self) -> int:

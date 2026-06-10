@@ -52,7 +52,9 @@ def evaluate(model, loader, device, max_batches=50):
         ids = batch["input_ids"].to(device)
         mask = batch["attention_mask"].to(device)
         labels = batch["labels"].to(device)
-        out = model(ids, mask, labels)
+        feats = batch.get("pattern_feats")
+        feats = feats.to(device) if feats is not None else None
+        out = model(ids, mask, labels, pattern_feats=feats)
         logits = out["logits"]
         if out["loss"] is not None:
             loss_sum += out["loss"].item()
@@ -149,7 +151,9 @@ def main():
             ids = batch["input_ids"].to(device)
             mask = batch["attention_mask"].to(device)
             labels = batch["labels"].to(device)
-            out = model(ids, mask, labels)
+            feats = batch.get("pattern_feats")
+            feats = feats.to(device) if feats is not None else None
+            out = model(ids, mask, labels, pattern_feats=feats)
             loss = out["loss"] / tcfg.grad_accum
             loss.backward()
 

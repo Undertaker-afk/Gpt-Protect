@@ -68,6 +68,11 @@ BATCH = int(os.environ.get("BATCH_SIZE", "8"))
 BASE_SAMPLES = int(os.environ.get("BASE_SAMPLES", "4000"))
 SAVE_EVERY = int(os.environ.get("SAVE_EVERY", "25"))   # steps between ckpts
 TRAIN_ENABLED = os.environ.get("TRAIN", "1") == "1"
+# how long the SIGTERM handler waits for the training thread to finish a step
+UPDATE_GRACE_MARGIN = int(os.environ.get("UPDATE_GRACE_MARGIN", "30"))
+UPDATER_STATUS_PATH = os.path.join(DATA_DIR, "updater.json")
+# touch-file the dashboard writes to ask the app.py supervisor to check now
+FORCE_UPDATE_FLAG = os.path.join(DATA_DIR, "force_update")
 
 LABELS = {0: "HUMAN", 1: "AI-GENERATED"}
 
@@ -104,11 +109,15 @@ class RealtimeTrainer:
         self.state = {
             "global_step": 0, "samples_seen": 0, "user_samples": 0,
             "loss_ema": None, "acc_ema": None, "best_acc": 0.0,
+            "steps_per_s": None,
+            "cm": {"tp": 0, "tn": 0, "fp": 0, "fn": 0},
             "started_at": None, "last_save": 0, "status": "init",
             "preset": PRESET, "params_M": round(self.model.num_parameters() / 1e6, 2),
             "device": self.device, "data_dir": DATA_DIR,
         }
+        self._last_step_t = None
         self.loss_hist = deque(maxlen=300)     # (step, loss)
+        self.acc_hist = deque(maxlen=300)      # (step, acc_ema)
         self.log_lines = deque(maxlen=40)
 
         self._load_state()
@@ -198,8 +207,14 @@ class RealtimeTrainer:
     def _load_base_data(self):
         """Load a capped slice of the public datasets for continual training."""
         try:
-            from dataset import load_human_ai
-            ds = load_human_ai(max_samples=BASE_SAMPLES, preprocess=True)
+            from dataset import load_human_ai, DATASET_SPECS
+            # stream only ~enough per source to fill BASE_SAMPLES after shuffle,
+            # so startup stays light on a 2-vCPU / 16 GB Space.
+            n_specs = max(1, len(DATASET_SPECS))
+            per = int(os.environ.get(
+                "DATASET_PER_CAP", str(max(200, (BASE_SAMPLES // n_specs) * 2))))
+            ds = load_human_ai(max_samples=BASE_SAMPLES, per_dataset=per,
+                               preprocess=True)
             for r in ds:
                 self.base[int(r["label"])].append(r["text"])
             self._log(f"base dataset: human={len(self.base[0])}, "
@@ -248,6 +263,7 @@ class RealtimeTrainer:
         return None
 
     def _make_batch(self):
+        from ai_patterns import feature_vector
         items = []
         for i in range(BATCH):
             picked = self._sample_label(i % 2)        # alternate human/ai
@@ -255,26 +271,29 @@ class RealtimeTrainer:
                 return None
             text, label = picked
             text = self.aug(text)
+            feats = feature_vector(text)
             enc = self.tok(text, truncation=True, max_length=MAX_SEQ)
             ids = enc["input_ids"][:MAX_SEQ] or [self.pad_id]
-            items.append((ids, label))
-        maxlen = max(len(i) for i, _ in items)
-        bx, bm, by = [], [], []
-        for ids, label in items:
+            items.append((ids, label, feats))
+        maxlen = max(len(i) for i, _, _ in items)
+        bx, bm, by, bf = [], [], [], []
+        for ids, label, feats in items:
             pad = maxlen - len(ids)
             bx.append(ids + [self.pad_id] * pad)
             bm.append([1] * len(ids) + [0] * pad)
             by.append(label)
-        return (torch.tensor(bx), torch.tensor(bm), torch.tensor(by))
+            bf.append(feats)
+        return (torch.tensor(bx), torch.tensor(bm), torch.tensor(by),
+                torch.tensor(bf, dtype=torch.float))
 
     # ----- training loop ------------------------------------------------ #
     def _train_step(self):
         batch = self._make_batch()
         if batch is None:
             return False
-        ids, mask, labels = (t.to(self.device) for t in batch)
+        ids, mask, labels, feats = (t.to(self.device) for t in batch)
         self.model.train()
-        out = self.model(ids, mask, labels)
+        out = self.model(ids, mask, labels, pattern_feats=feats)
         loss = out["loss"]
         self.opt.zero_grad()
         loss.backward()
@@ -282,8 +301,10 @@ class RealtimeTrainer:
         self.opt.step()
 
         with torch.no_grad():
-            acc = (out["logits"].argmax(-1) == labels).float().mean().item()
+            preds = out["logits"].argmax(-1)
+            acc = (preds == labels).float().mean().item()
         l = float(loss.item())
+        now = time.time()
         with self.lock:
             self.state["global_step"] += 1
             self.state["samples_seen"] += labels.numel()
@@ -292,7 +313,21 @@ class RealtimeTrainer:
             self.state["acc_ema"] = acc if self.state["acc_ema"] is None \
                 else 0.98 * self.state["acc_ema"] + 0.02 * acc
             self.state["best_acc"] = max(self.state["best_acc"], self.state["acc_ema"])
+            # throughput (steps/sec EMA)
+            if self._last_step_t is not None:
+                dt = max(now - self._last_step_t, 1e-6)
+                sps = 1.0 / dt
+                self.state["steps_per_s"] = sps if self.state["steps_per_s"] is None \
+                    else 0.9 * self.state["steps_per_s"] + 0.1 * sps
+            self._last_step_t = now
+            # running confusion-matrix tallies (TP/TN/FP/FN), AI = positive
+            for p, y in zip(preds.tolist(), labels.tolist()):
+                if y == 1 and p == 1: self.state["cm"]["tp"] += 1
+                elif y == 0 and p == 0: self.state["cm"]["tn"] += 1
+                elif y == 0 and p == 1: self.state["cm"]["fp"] += 1
+                else: self.state["cm"]["fn"] += 1
             self.loss_hist.append((self.state["global_step"], round(l, 4)))
+            self.acc_hist.append((self.state["global_step"], round(self.state["acc_ema"], 4)))
         return True
 
     def _loop(self):
@@ -336,16 +371,25 @@ class RealtimeTrainer:
     # ----- inference ---------------------------------------------------- #
     @torch.no_grad()
     def predict(self, text: str):
+        from ai_patterns import feature_vector, heuristic_ai_score, top_signals
         text = self.pre(text)
         if not text:
-            return None, {}
+            return None, {}, {}
+        feats = torch.tensor([feature_vector(text)], dtype=torch.float,
+                             device=self.device)
         enc = self.tok(text, truncation=True, max_length=MAX_SEQ)
         ids = enc["input_ids"][:MAX_SEQ] or [self.pad_id]
         x = torch.tensor([ids], device=self.device)
         m = torch.ones_like(x)
         self.model.eval()
-        prob = self.model.predict_proba(x, m)[0].tolist()
-        return prob, stylometric_features(text)
+        prob = self.model.predict_proba(x, m, pattern_feats=feats)[0].tolist()
+        explain = {
+            "neural_ai_prob": round(prob[1], 4),
+            "heuristic_ai_score": round(heuristic_ai_score(text), 4),
+            "top_signals": top_signals(text, 6),
+            "stylometry": stylometric_features(text),
+        }
+        return prob, explain, stylometric_features(text)
 
 
 # --------------------------------------------------------------------------- #
@@ -354,18 +398,25 @@ class RealtimeTrainer:
 def build_ui(trainer: RealtimeTrainer):
     import gradio as gr
 
+    import pandas as pd
+
     def analyze(text):
         if not text or not text.strip():
             return {"HUMAN": 0.0, "AI-GENERATED": 0.0}, {}, "Enter some text."
-        prob, feats = trainer.predict(text)
+        prob, explain, _ = trainer.predict(text)
         if prob is None:
             return {"HUMAN": 0.0, "AI-GENERATED": 0.0}, {}, "Empty after cleaning."
         verdict = LABELS[int(prob[1] >= 0.5)]
         conf = max(prob) * 100
-        note = (f"**{verdict}**  ·  {conf:.1f}% confidence  ·  "
+        h = explain["heuristic_ai_score"]
+        agree = "✅ agree" if (h >= 0.5) == (prob[1] >= 0.5) else "⚠️ disagree"
+        tops = ", ".join(t["signal"] for t in explain["top_signals"][:3])
+        note = (f"**{verdict}** · {conf:.1f}% confidence · "
+                f"neural AI-prob {prob[1]:.2f} vs heuristic {h:.2f} ({agree})  \n"
+                f"top AI signals: _{tops}_  \n"
                 f"model step {trainer.state['global_step']} "
                 f"(acc≈{(trainer.state['acc_ema'] or 0):.2f})")
-        return {"HUMAN": prob[0], "AI-GENERATED": prob[1]}, feats, note
+        return {"HUMAN": prob[0], "AI-GENERATED": prob[1]}, explain, note
 
     def feedback(text, lbl):
         if not text or not text.strip():
@@ -374,30 +425,78 @@ def build_ui(trainer: RealtimeTrainer):
         return (f"✅ saved as **{LABELS[lbl]}** and queued for training "
                 f"(user samples: {trainer.state['user_samples']}).")
 
+    def force_update_now():
+        try:
+            with open(FORCE_UPDATE_FLAG, "w") as f:
+                f.write(str(time.time()))
+            return ("🔄 Update check requested — the supervisor will `git fetch` "
+                    "on its next tick (≤30 s). If GitHub differs, training pauses "
+                    "at a checkpoint and the Space updates + resumes.")
+        except Exception as e:
+            return f"Could not request update: {e}"
+
+    def _metrics(s):
+        cm = s["cm"]
+        tp, tn, fp, fn = cm["tp"], cm["tn"], cm["fp"], cm["fn"]
+        prec = tp / (tp + fp) if (tp + fp) else 0.0
+        rec = tp / (tp + fn) if (tp + fn) else 0.0
+        f1 = 2 * prec * rec / (prec + rec) if (prec + rec) else 0.0
+        return prec, rec, f1
+
     def dashboard():
         s = trainer.state
         up = (time.time() - s["started_at"]) if s["started_at"] else 0
+        prec, rec, f1 = _metrics(s)
+        sps = s.get("steps_per_s") or 0.0
         md = (
             f"| metric | value |\n|---|---|\n"
             f"| status | **{s['status']}** |\n"
             f"| preset / params | {s['preset']} / {s['params_M']}M |\n"
             f"| device | {s['device']} |\n"
             f"| global step | {s['global_step']} |\n"
+            f"| throughput | {sps:.2f} steps/s |\n"
             f"| samples seen | {s['samples_seen']} |\n"
             f"| user samples | {s['user_samples']} |\n"
-            f"| loss (EMA) | {(s['loss_ema'] if s['loss_ema'] is not None else 0):.4f} |\n"
-            f"| acc (EMA) | {(s['acc_ema'] if s['acc_ema'] is not None else 0):.3f} |\n"
+            f"| loss (EMA) | {(s['loss_ema'] or 0):.4f} |\n"
+            f"| acc (EMA) | {(s['acc_ema'] or 0):.3f} |\n"
             f"| best acc | {s['best_acc']:.3f} |\n"
+            f"| precision / recall / F1 | {prec:.3f} / {rec:.3f} / {f1:.3f} |\n"
             f"| last checkpoint @step | {s['last_save']} |\n"
             f"| uptime | {up/60:.1f} min |\n"
             f"| storage | `{s['data_dir']}` |\n"
         )
-        import pandas as pd
-        hist = list(trainer.loss_hist)
-        df = pd.DataFrame(hist, columns=["step", "loss"]) if hist else \
+        try:
+            if os.path.exists(UPDATER_STATUS_PATH):
+                with open(UPDATER_STATUS_PATH) as f:
+                    u = json.load(f)
+                age = (time.time() - u.get("last_check", time.time())) / 60
+                upd = "🔄 updating…" if u.get("updating") else "✅ up to date"
+                md += (f"| github | {upd} |\n"
+                       f"| local rev | `{(u.get('local_sha') or '')[:7]}` |\n"
+                       f"| remote rev | `{(u.get('remote_sha') or '')[:7]}` |\n"
+                       f"| last update check | {age:.1f} min ago |\n")
+        except Exception:
+            pass
+
+        lh = list(trainer.loss_hist)
+        loss_df = pd.DataFrame(lh, columns=["step", "loss"]) if lh else \
             pd.DataFrame({"step": [], "loss": []})
-        logs = "\n".join(list(trainer.log_lines)[-15:])
-        return md, df, logs
+        ah = list(trainer.acc_hist)
+        acc_df = pd.DataFrame(ah, columns=["step", "accuracy"]) if ah else \
+            pd.DataFrame({"step": [], "accuracy": []})
+
+        dist_df = pd.DataFrame({
+            "pool": ["base·human", "base·ai", "user·human", "user·ai"],
+            "count": [len(trainer.base[0]), len(trainer.base[1]),
+                      len(trainer.user[0]), len(trainer.user[1])],
+        })
+        cm = s["cm"]
+        cm_df = pd.DataFrame({
+            "cell": ["TP (ai✓)", "TN (human✓)", "FP (human→ai)", "FN (ai→human)"],
+            "count": [cm["tp"], cm["tn"], cm["fp"], cm["fn"]],
+        })
+        logs = "\n".join(list(trainer.log_lines)[-16:])
+        return md, loss_df, acc_df, dist_df, cm_df, logs
 
     try:
         _theme = gr.themes.Soft()
@@ -407,9 +506,9 @@ def build_ui(trainer: RealtimeTrainer):
         demo._gptprotect_theme = _theme
         gr.Markdown(
             "# 🛡️ GPT-Protect — AI Text Detector\n"
-            "MoE + Hybrid-Attention detector (DeepSeek-V4-Pro / TurboQuant inspired). "
-            "Paste text to classify it as **human** or **AI-generated**. Your labeled "
-            "feedback trains the model in real time and is persisted to the data bucket."
+            "MoE + Hybrid-Attention detector with an **intelligent AI-pattern engine** "
+            "(burstiness, perplexity proxy, repetition, AI-tell lexicon, …) fused into "
+            "the model. Your labeled feedback trains it in real time, persisted to /data."
         )
         with gr.Tab("🔍 Detect"):
             with gr.Row():
@@ -425,22 +524,36 @@ def build_ui(trainer: RealtimeTrainer):
                     fb = gr.Markdown()
                 with gr.Column(scale=2):
                     out = gr.Label(label="Prediction", num_top_classes=2)
-                    feats = gr.JSON(label="Stylometric features")
-            btn.click(analyze, inp, [out, feats, note])
+                    explain = gr.JSON(label="AI-pattern analysis (neural + heuristic)")
+            btn.click(analyze, inp, [out, explain, note])
             b_h.click(lambda t: feedback(t, 0), inp, fb)
             b_a.click(lambda t: feedback(t, 1), inp, fb)
 
         with gr.Tab("📈 Training dashboard"):
-            gr.Markdown("Live realtime-training metrics (auto-refresh every 3 s).")
+            with gr.Row():
+                gr.Markdown("Live realtime-training metrics (auto-refresh every 3 s).")
+                upd_btn = gr.Button("🔄 Check GitHub for update now", scale=0)
+            upd_msg = gr.Markdown()
             with gr.Row():
                 stats_md = gr.Markdown()
                 with gr.Column():
-                    loss_plot = gr.LinePlot(x="step", y="loss", title="Training loss",
-                                            height=260)
+                    loss_plot = gr.LinePlot(x="step", y="loss",
+                                            title="Training loss", height=240)
+                    acc_plot = gr.LinePlot(x="step", y="accuracy",
+                                           title="Accuracy (EMA)", height=240)
+            with gr.Row():
+                dist_plot = gr.BarPlot(x="pool", y="count",
+                                       title="Training-pool composition", height=240)
+                cm_plot = gr.BarPlot(x="cell", y="count",
+                                     title="Confusion tallies (AI = positive)",
+                                     height=240)
             logbox = gr.Textbox(label="Recent log", lines=12, interactive=False)
+
+            outs = [stats_md, loss_plot, acc_plot, dist_plot, cm_plot, logbox]
             timer = gr.Timer(3.0)
-            timer.tick(dashboard, None, [stats_md, loss_plot, logbox])
-            demo.load(dashboard, None, [stats_md, loss_plot, logbox])
+            timer.tick(dashboard, None, outs)
+            demo.load(dashboard, None, outs)
+            upd_btn.click(force_update_now, None, upd_msg)
 
     return demo
 
@@ -449,6 +562,29 @@ def main():
     print(f"[main] data dir = {DATA_DIR}  preset = {PRESET}")
     trainer = RealtimeTrainer()
     trainer.start()
+
+    # Graceful shutdown for the app.py auto-updater: pause training, write a
+    # final checkpoint, then exit so the supervisor can pull + restart.
+    import signal
+
+    def _graceful(signum, frame):
+        try:
+            trainer._log(f"signal {signum}: pausing & checkpointing before exit")
+            trainer.state["status"] = "pausing for update"
+            trainer.stop()
+            if trainer.thread:
+                trainer.thread.join(timeout=max(5, UPDATE_GRACE_MARGIN))
+            trainer._save_ckpt()
+            trainer._log("checkpoint saved; exiting for update")
+        finally:
+            os._exit(0)
+
+    for _sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(_sig, _graceful)
+        except Exception:
+            pass
+
     demo = build_ui(trainer)
     port = int(os.environ.get("PORT", "7860"))
     kw = dict(server_name="0.0.0.0", server_port=port)
