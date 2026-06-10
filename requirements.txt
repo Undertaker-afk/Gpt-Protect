@@ -1,0 +1,11 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.2
+numpy
+transformers>=4.40
+tokenizers
+datasets
+safetensors
+huggingface_hub
+scikit-learn
+pandas
+gradio>=4.44
