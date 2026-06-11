@@ -84,8 +84,13 @@ local/remote commit and update status.
 
 * **🔍 Detect** — paste text → HUMAN/AI verdict, confidence, the **neural vs.
   heuristic AI-score** (and whether they agree), the **top AI signals**, and a
-  full pattern/stylometry breakdown. Use the *HUMAN* / *AI* buttons to label the
-  sample; it is saved to `/data/collected.jsonl` and folded into training at once.
+  full pattern/stylometry breakdown. The analyzed text is shown as a
+  **sentence-level AI heatmap** (red = AI-leaning, amber = mixed, green =
+  human-leaning) with a **per-sentence/phrase table** — phrase length, char
+  count, avg word length, long-word count, the AI-tell words detected, and both
+  the **statistics AI%** and the **model AI%** for each sentence. Use the
+  *HUMAN* / *AI* buttons to label the sample; it is saved to
+  `/data/collected.jsonl` and folded into training at once.
 * **📈 Training dashboard** — live step / loss / accuracy / throughput /
   precision-recall-F1, **loss & accuracy curves**, **pool-composition** and
   **confusion** bar charts, a recent-events log (auto-refresh every 3 s), and a

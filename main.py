@@ -370,26 +370,80 @@ class RealtimeTrainer:
 
     # ----- inference ---------------------------------------------------- #
     @torch.no_grad()
+    def _model_probs(self, texts):
+        """Batched neural AI-probability for a list of texts."""
+        from ai_patterns import feature_vector
+        if not texts:
+            return []
+        encs, feats = [], []
+        for t in texts:
+            e = self.tok(t, truncation=True, max_length=MAX_SEQ)["input_ids"]
+            encs.append(e[:MAX_SEQ] or [self.pad_id])
+            feats.append(feature_vector(t))
+        maxlen = max(len(e) for e in encs)
+        bx, bm = [], []
+        for e in encs:
+            pad = maxlen - len(e)
+            bx.append(e + [self.pad_id] * pad)
+            bm.append([1] * len(e) + [0] * pad)
+        x = torch.tensor(bx, device=self.device)
+        m = torch.tensor(bm, device=self.device)
+        ft = torch.tensor(feats, dtype=torch.float, device=self.device)
+        self.model.eval()
+        return self.model.predict_proba(x, m, pattern_feats=ft)[:, 1].tolist()
+
+    @torch.no_grad()
     def predict(self, text: str):
-        from ai_patterns import feature_vector, heuristic_ai_score, top_signals
+        from ai_patterns import (feature_vector, heuristic_ai_score, top_signals,
+                                 sentence_list, find_ai_tells, extract_features)
         text = self.pre(text)
         if not text:
             return None, {}, {}
-        feats = torch.tensor([feature_vector(text)], dtype=torch.float,
-                             device=self.device)
-        enc = self.tok(text, truncation=True, max_length=MAX_SEQ)
-        ids = enc["input_ids"][:MAX_SEQ] or [self.pad_id]
-        x = torch.tensor([ids], device=self.device)
-        m = torch.ones_like(x)
-        self.model.eval()
-        prob = self.model.predict_proba(x, m, pattern_feats=feats)[0].tolist()
+        prob = self._model_probs([text])
+        ai_prob = prob[0] if prob else 0.5
+        full = [1 - ai_prob, ai_prob]
         explain = {
-            "neural_ai_prob": round(prob[1], 4),
+            "neural_ai_prob": round(ai_prob, 4),
             "heuristic_ai_score": round(heuristic_ai_score(text), 4),
             "top_signals": top_signals(text, 6),
             "stylometry": stylometric_features(text),
         }
-        return prob, explain, stylometric_features(text)
+
+        # ---- per-sentence / phrase breakdown (stats + model) ----------- #
+        sents = sentence_list(text)
+        sent_model = self._model_probs(sents) if sents else []
+        highlighted, rows = [], []
+        for i, s in enumerate(sents):
+            f = extract_features(s)
+            heur = heuristic_ai_score(s)
+            mdl = sent_model[i] if i < len(sent_model) else ai_prob
+            blend = 0.5 * heur + 0.5 * mdl
+            tells = find_ai_tells(s)
+            bucket = ("AI-leaning" if blend >= 0.6
+                      else "human-leaning" if blend <= 0.4 else "mixed")
+            highlighted.append((s + " ", bucket))
+            long_words = sum(1 for w in s.split() if len(w) >= 8)
+            rows.append([
+                i + 1,
+                len(s.split()),
+                len(s),
+                round(f["avg_word_len"], 2),
+                long_words,
+                ", ".join(tells) if tells else "—",
+                f"{int(round(heur*100))}%",
+                f"{int(round(mdl*100))}%",
+                bucket,
+            ])
+        if not highlighted:
+            highlighted = [(text, "mixed")]
+        breakdown = {
+            "analyzed_text": text,
+            "highlighted": highlighted,
+            "rows": rows,
+            "columns": ["#", "words", "chars", "avg word len", "long words",
+                        "AI-tell words", "stats AI%", "model AI%", "verdict"],
+        }
+        return full, explain, breakdown
 
 
 # --------------------------------------------------------------------------- #
@@ -400,12 +454,18 @@ def build_ui(trainer: RealtimeTrainer):
 
     import pandas as pd
 
+    _EMPTY_TBL = pd.DataFrame(
+        columns=["#", "words", "chars", "avg word len", "long words",
+                 "AI-tell words", "stats AI%", "model AI%", "verdict"])
+
     def analyze(text):
         if not text or not text.strip():
-            return {"HUMAN": 0.0, "AI-GENERATED": 0.0}, {}, "Enter some text."
-        prob, explain, _ = trainer.predict(text)
+            return ({"HUMAN": 0.0, "AI-GENERATED": 0.0}, [("Enter some text.", None)],
+                    _EMPTY_TBL, {}, "Enter some text.")
+        prob, explain, breakdown = trainer.predict(text)
         if prob is None:
-            return {"HUMAN": 0.0, "AI-GENERATED": 0.0}, {}, "Empty after cleaning."
+            return ({"HUMAN": 0.0, "AI-GENERATED": 0.0}, [("Empty after cleaning.", None)],
+                    _EMPTY_TBL, {}, "Empty after cleaning.")
         verdict = LABELS[int(prob[1] >= 0.5)]
         conf = max(prob) * 100
         h = explain["heuristic_ai_score"]
@@ -414,9 +474,11 @@ def build_ui(trainer: RealtimeTrainer):
         note = (f"**{verdict}** · {conf:.1f}% confidence · "
                 f"neural AI-prob {prob[1]:.2f} vs heuristic {h:.2f} ({agree})  \n"
                 f"top AI signals: _{tops}_  \n"
-                f"model step {trainer.state['global_step']} "
-                f"(acc≈{(trainer.state['acc_ema'] or 0):.2f})")
-        return {"HUMAN": prob[0], "AI-GENERATED": prob[1]}, explain, note
+                f"{len(breakdown['rows'])} sentences analyzed · model step "
+                f"{trainer.state['global_step']} (acc≈{(trainer.state['acc_ema'] or 0):.2f})")
+        heat = breakdown["highlighted"]
+        tbl = pd.DataFrame(breakdown["rows"], columns=breakdown["columns"])
+        return {"HUMAN": prob[0], "AI-GENERATED": prob[1]}, heat, tbl, explain, note
 
     def feedback(text, lbl):
         if not text or not text.strip():
@@ -525,7 +587,21 @@ def build_ui(trainer: RealtimeTrainer):
                 with gr.Column(scale=2):
                     out = gr.Label(label="Prediction", num_top_classes=2)
                     explain = gr.JSON(label="AI-pattern analysis (neural + heuristic)")
-            btn.click(analyze, inp, [out, explain, note])
+            gr.Markdown("### 🔦 Analyzed text — sentence AI-heatmap")
+            gr.Markdown("Red = AI-leaning · amber = mixed · green = human-leaning "
+                        "(blend of statistics + model).")
+            heat = gr.HighlightedText(
+                label="What was detected (per sentence)",
+                combine_adjacent=False, show_legend=True,
+                color_map={"AI-leaning": "#ef4444", "mixed": "#f59e0b",
+                           "human-leaning": "#22c55e"})
+            gr.Markdown("### 📋 Per-sentence / phrase breakdown")
+            table = gr.Dataframe(
+                headers=["#", "words", "chars", "avg word len", "long words",
+                         "AI-tell words", "stats AI%", "model AI%", "verdict"],
+                label="Phrase length & what statistics / the model flagged",
+                wrap=True, interactive=False)
+            btn.click(analyze, inp, [out, heat, table, explain, note])
             b_h.click(lambda t: feedback(t, 0), inp, fb)
             b_a.click(lambda t: feedback(t, 1), inp, fb)
 

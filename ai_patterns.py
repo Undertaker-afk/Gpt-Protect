@@ -154,6 +154,24 @@ def heuristic_ai_score(text: str) -> float:
     return float(1.0 / (1.0 + math.exp(-(z + bias))))
 
 
+def find_ai_tells(text: str):
+    """Return the AI-tell words/phrases actually present in the text."""
+    low = (text or "").lower()
+    hits = []
+    for p in AI_TELLS:
+        if p in low and p not in hits:
+            hits.append(p)
+    return hits
+
+
+def sentence_list(text: str, max_sentences: int = 80):
+    """Split into sentences, keeping trailing punctuation, capped for cost."""
+    text = text or ""
+    parts = re.split(r"(?<=[.!?])\s+", text)
+    sents = [s.strip() for s in parts if s and s.strip()]
+    return sents[:max_sentences]
+
+
 def top_signals(text: str, k: int = 6):
     """Return the k features contributing most to an AI verdict (for the UI)."""
     f = extract_features(text)

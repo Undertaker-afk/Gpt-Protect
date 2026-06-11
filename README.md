@@ -87,7 +87,10 @@ use `MODEL_PRESET=tiny`.
 ### UI
 * **🔍 Detect** — paste text → HUMAN/AI verdict, confidence, **neural vs. heuristic
   AI-score agreement**, top contributing AI signals, and a full pattern/stylometry
-  breakdown; label it to train the model live.
+  breakdown; label it to train the model live. The analyzed text is rendered as a
+  **sentence-level AI heatmap** (red/amber/green) plus a **per-sentence/phrase table**
+  (word & char counts, avg word length, long-word count, the AI-tell words found, and
+  both the **statistics AI%** and the **model AI%** for every sentence).
 * **📈 Dashboard** — live step / loss / accuracy / throughput / precision-recall-F1,
   **loss & accuracy curves**, **training-pool composition** and **confusion tallies**
   bar charts, plus a **"Check GitHub for update now"** button (forces the auto-updater
