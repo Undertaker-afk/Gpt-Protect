@@ -60,6 +60,13 @@ one labeled stream (`0=human, 1=ai`):
 Add more by appending to `DATASET_SPECS`. The corpus is human-heavy, so the
 realtime trainer samples **label-balanced** batches.
 
+On the Space these are pulled by a **fair background harvester** (`main.py`):
+it round-robins all sources, fetching small paced chunks from each up to
+`DATASET_TARGET`, and caches them to `/data/base_cache.jsonl` so the pool grows
+across restarts and **every** source is represented equally — not just the first
+couple (which is what happens if unauthenticated streaming gets rate-limited; set
+an `HF_TOKEN` secret to avoid that). The dashboard shows per-source progress.
+
 ## Train
 
 ```bash

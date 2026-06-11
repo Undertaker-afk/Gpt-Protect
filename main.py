@@ -61,11 +61,18 @@ CKPT_PATH = os.path.join(CKPT_DIR, "last.pt")
 STATE_PATH = os.path.join(DATA_DIR, "state.json")
 COLLECTED_PATH = os.path.join(DATA_DIR, "collected.jsonl")
 LOG_PATH = os.path.join(DATA_DIR, "train_log.jsonl")
+BASE_CACHE_PATH = os.path.join(DATA_DIR, "base_cache.jsonl")
 
 PRESET = os.environ.get("MODEL_PRESET", "tiny")        # free CPU -> tiny
 MAX_SEQ = int(os.environ.get("MAX_SEQ_LEN", "192"))
 BATCH = int(os.environ.get("BATCH_SIZE", "8"))
 BASE_SAMPLES = int(os.environ.get("BASE_SAMPLES", "4000"))
+# incremental harvester: per-source in-memory target, synchronous seed per
+# source, round-robin chunk size, and a pacing delay to dodge HF rate limits.
+DATASET_TARGET = int(os.environ.get("DATASET_TARGET", "1500"))
+SEED_PER_SOURCE = int(os.environ.get("SEED_PER_SOURCE", "25"))
+HARVEST_CHUNK = int(os.environ.get("HARVEST_CHUNK", "40"))
+HARVEST_PACE_SEC = float(os.environ.get("HARVEST_PACE_SEC", "0.4"))
 SAVE_EVERY = int(os.environ.get("SAVE_EVERY", "25"))   # steps between ckpts
 TRAIN_ENABLED = os.environ.get("TRAIN", "1") == "1"
 # how long the SIGTERM handler waits for the training thread to finish a step
@@ -128,12 +135,17 @@ class RealtimeTrainer:
         self.base = {0: [], 1: []}
         self.user = {0: [], 1: []}
         self.user_data = []                      # canonical list (count/persist)
-        self._load_base_data()
+        self.source_counts = {}                  # per-dataset in-memory tally
+        self._seen_base = set()                  # de-dup hashes for base cache
+        self._harvest_iters = {}                 # persistent per-source streams
+        self._load_base_cache()                  # instant: grows across restarts
+        self._seed_base()                        # quick balanced seed if needed
         self._load_collected()
         self.state["user_samples"] = len(self.user_data)
 
         self._stop = threading.Event()
         self.thread = None
+        self.harvest_thread = None
 
     # ----- persistence ------------------------------------------------- #
     def _log(self, msg):
@@ -204,23 +216,123 @@ class RealtimeTrainer:
             except Exception as e:
                 self._log(f"collected load failed: {e}")
 
-    def _load_base_data(self):
-        """Load a capped slice of the public datasets for continual training."""
+    # ----- base dataset harvesting (incremental + cached + fair) -------- #
+    def _add_base(self, name, text, label, persist=True):
+        """Add one base sample to the pools (deduped) and optionally cache it."""
+        text = self.pre(text)
+        if not text:
+            return False
+        if self.source_counts.get(name, 0) >= DATASET_TARGET:
+            return False
+        h = hash((label, text[:160]))
+        if h in self._seen_base:
+            return False
+        self._seen_base.add(h)
+        with self.lock:
+            self.base[label].append(text)
+        self.source_counts[name] = self.source_counts.get(name, 0) + 1
+        if persist:
+            try:
+                with open(BASE_CACHE_PATH, "a") as f:
+                    f.write(json.dumps({"n": name, "text": text,
+                                        "label": int(label)}) + "\n")
+            except Exception:
+                pass
+        return True
+
+    def _load_base_cache(self):
+        """Reload previously-harvested base samples from /data (fast, offline)."""
+        if not os.path.exists(BASE_CACHE_PATH):
+            return
+        n = 0
         try:
-            from dataset import load_human_ai, DATASET_SPECS
-            # stream only ~enough per source to fill BASE_SAMPLES after shuffle,
-            # so startup stays light on a 2-vCPU / 16 GB Space.
-            n_specs = max(1, len(DATASET_SPECS))
-            per = int(os.environ.get(
-                "DATASET_PER_CAP", str(max(200, (BASE_SAMPLES // n_specs) * 2))))
-            ds = load_human_ai(max_samples=BASE_SAMPLES, per_dataset=per,
-                               preprocess=True)
-            for r in ds:
-                self.base[int(r["label"])].append(r["text"])
-            self._log(f"base dataset: human={len(self.base[0])}, "
-                      f"ai={len(self.base[1])}")
+            with open(BASE_CACHE_PATH) as f:
+                for line in f:
+                    try:
+                        r = json.loads(line)
+                    except Exception:
+                        continue
+                    name, text, lbl = r.get("n"), r.get("text"), r.get("label")
+                    if text and lbl in (0, 1):
+                        if self._add_base(name or "?", text, int(lbl), persist=False):
+                            n += 1
+            self._log(f"base cache: {n} samples across "
+                      f"{len(self.source_counts)} sources")
         except Exception as e:
-            self._log(f"base data unavailable ({e}); training on user data only")
+            self._log(f"base cache load failed: {e}")
+
+    def _seed_base(self):
+        """Synchronously pull a small balanced seed from each source so training
+        can start immediately and fairly, even on a cold (empty-cache) start."""
+        try:
+            from dataset import DATASET_SPECS, open_stream
+        except Exception as e:
+            self._log(f"dataset module unavailable: {e}")
+            return
+        for spec in DATASET_SPECS:
+            name = spec["name"]
+            if self.source_counts.get(name, 0) >= SEED_PER_SOURCE:
+                continue
+            got = 0
+            try:
+                it = open_stream(spec)
+                self._harvest_iters[name] = it
+                for text, lbl in it:
+                    if self._add_base(name, text, lbl):
+                        got += 1
+                    if got >= SEED_PER_SOURCE:
+                        break
+            except Exception as e:
+                self._log(f"seed {name}: {repr(e)[:80]}")
+        self._log(f"seed done: human={len(self.base[0])} ai={len(self.base[1])} "
+                  f"sources={sum(1 for v in self.source_counts.values() if v)}")
+
+    def _harvest_loop(self):
+        """Background round-robin harvester: keeps topping up every source to
+        DATASET_TARGET, paced to dodge rate limits, retrying on error, caching
+        to /data so the pool grows monotonically across restarts."""
+        try:
+            from dataset import DATASET_SPECS, open_stream
+        except Exception:
+            return
+        self._log("base harvester started")
+        while not self._stop.is_set():
+            progressed = False
+            for spec in DATASET_SPECS:
+                if self._stop.is_set():
+                    break
+                name = spec["name"]
+                if self.source_counts.get(name, 0) >= DATASET_TARGET:
+                    continue
+                try:
+                    it = self._harvest_iters.get(name)
+                    if it is None:
+                        it = open_stream(spec)
+                        self._harvest_iters[name] = it
+                    got = 0
+                    exhausted = True
+                    for text, lbl in it:
+                        if self._add_base(name, text, lbl):
+                            got += 1
+                            progressed = True
+                        if got >= HARVEST_CHUNK or \
+                                self.source_counts.get(name, 0) >= DATASET_TARGET:
+                            exhausted = False
+                            break
+                    if exhausted:               # stream ended -> recreate later
+                        self._harvest_iters[name] = None
+                except Exception as e:
+                    self._log(f"harvest {name}: {repr(e)[:70]}")
+                    self._harvest_iters[name] = None
+                    time.sleep(2.0)
+                time.sleep(HARVEST_PACE_SEC)    # gentle pacing
+            if all(self.source_counts.get(s["name"], 0) >= DATASET_TARGET
+                   for s in DATASET_SPECS):
+                self._log("base harvest complete: all sources at target")
+                break
+            if not progressed:
+                time.sleep(15.0)
+        self.state["base_total"] = len(self.base[0]) + len(self.base[1])
 
     # ----- data submission --------------------------------------------- #
     def add_sample(self, text: str, label: int):
@@ -356,12 +468,18 @@ class RealtimeTrainer:
         self._log("training loop stopped")
 
     def start(self):
+        # background base-data harvester runs regardless of TRAIN so all 8
+        # sources keep filling up (and caching) even in inference-only mode.
+        self._stop.clear()
+        if not (self.harvest_thread and self.harvest_thread.is_alive()):
+            self.harvest_thread = threading.Thread(target=self._harvest_loop,
+                                                   daemon=True)
+            self.harvest_thread.start()
         if not TRAIN_ENABLED:
             self.state["status"] = "training disabled (TRAIN=0)"
             return
         if self.thread and self.thread.is_alive():
             return
-        self._stop.clear()
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
 
@@ -557,8 +675,18 @@ def build_ui(trainer: RealtimeTrainer):
             "cell": ["TP (ai✓)", "TN (human✓)", "FP (human→ai)", "FN (ai→human)"],
             "count": [cm["tp"], cm["tn"], cm["fp"], cm["fn"]],
         })
+        # per-source harvest progress (short names) toward DATASET_TARGET
+        sc = trainer.source_counts
+        src_df = pd.DataFrame({
+            "source": [n.split("/")[-1][:22] for n in sc],
+            "samples": [sc[n] for n in sc],
+        }) if sc else pd.DataFrame({"source": [], "samples": []})
+        done = sum(1 for v in sc.values() if v >= DATASET_TARGET)
+        md += (f"| base pool | {len(trainer.base[0])+len(trainer.base[1])} "
+               f"(human {len(trainer.base[0])} / ai {len(trainer.base[1])}) |\n"
+               f"| dataset sources | {len(sc)} active · {done}/{len(sc)} at target |\n")
         logs = "\n".join(list(trainer.log_lines)[-16:])
-        return md, loss_df, acc_df, dist_df, cm_df, logs
+        return md, loss_df, acc_df, dist_df, cm_df, src_df, logs
 
     try:
         _theme = gr.themes.Soft()
@@ -623,9 +751,13 @@ def build_ui(trainer: RealtimeTrainer):
                 cm_plot = gr.BarPlot(x="cell", y="count",
                                      title="Confusion tallies (AI = positive)",
                                      height=240)
+            src_plot = gr.BarPlot(x="source", y="samples",
+                                  title="Samples harvested per dataset source",
+                                  height=260)
             logbox = gr.Textbox(label="Recent log", lines=12, interactive=False)
 
-            outs = [stats_md, loss_plot, acc_plot, dist_plot, cm_plot, logbox]
+            outs = [stats_md, loss_plot, acc_plot, dist_plot, cm_plot,
+                    src_plot, logbox]
             timer = gr.Timer(3.0)
             timer.tick(dashboard, None, outs)
             demo.load(dashboard, None, outs)

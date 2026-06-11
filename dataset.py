@@ -16,6 +16,7 @@ enough for a 16 GB Space (some of these datasets have 100k+ rows).
 
 from __future__ import annotations
 
+import os
 from itertools import islice
 from typing import Optional
 
@@ -70,10 +71,49 @@ def _norm_label(v) -> Optional[int]:
     return LABEL_MAP.get(v)
 
 
+def _open_streaming(name):
+    """load_dataset(streaming) with a trust_remote_code fallback + HF token."""
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    try:
+        return load_dataset(name, streaming=True, token=token)
+    except TypeError:
+        return load_dataset(name, streaming=True)
+    except Exception:
+        # some datasets ship a loading script
+        return load_dataset(name, streaming=True, trust_remote_code=True,
+                            token=token)
+
+
+def open_stream(spec):
+    """Yield (text, label) for ALL rows of one source (across splits), streaming.
+    Used by the incremental background harvester — no per-call cap so the caller
+    controls pacing. Raw text (no preprocessing); skips malformed rows."""
+    name = spec["name"]
+    kind = spec["kind"]
+    ds = _open_streaming(name)
+    for split in list(ds.keys()):
+        for ex in ds[split]:
+            if kind == "human":
+                t = ex.get(spec["text"])
+                if t:
+                    yield t, HUMAN
+            elif kind == "paired":
+                h, a = ex.get(spec["human"]), ex.get(spec["ai"])
+                if h:
+                    yield h, HUMAN
+                if a:
+                    yield a, AI
+            else:
+                t = ex.get(spec["text"])
+                lbl = _norm_label(ex.get(spec["label"]))
+                if t and lbl is not None:
+                    yield t, lbl
+
+
 def _iter_spec(spec, per_dataset):
     """Yield (text, label) pairs for one source, streaming + capped."""
     name = spec["name"]
-    ds = load_dataset(name, streaming=True)
+    ds = _open_streaming(name)
     splits = list(ds.keys())
     kind = spec["kind"]
     # spread the cap across splits so we don't take only "train"

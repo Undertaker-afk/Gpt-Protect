@@ -60,8 +60,11 @@ local/remote commit and update status.
 | `UPDATE_GRACE_SEC` | `150` | seconds allowed for checkpoint-before-restart |
 | `MODEL_PRESET` | `tiny` | `tiny` fits free CPU+16GB; `0.4b`/`5b` need big HW |
 | `DATA_DIR` | `/data` | persistent bucket mount |
-| `BASE_SAMPLES` | `4000` | public-dataset rows mixed into training |
-| `DATASET_PER_CAP` | auto | max rows streamed per source dataset |
+| `DATASET_TARGET` | `1500` | per-source in-memory sample target (harvester) |
+| `SEED_PER_SOURCE` | `25` | rows pulled synchronously per source at startup |
+| `HARVEST_CHUNK` | `40` | rows fetched per source per round-robin round |
+| `HARVEST_PACE_SEC` | `0.4` | delay between fetches (dodges HF rate limits) |
+| `HF_TOKEN` | — | **set this as a secret** for higher HF rate limits |
 | `MAX_SEQ_LEN` | `192` | tokens per sample |
 | `BATCH_SIZE` | `8` | realtime training batch |
 | `SAVE_EVERY` | `25` | steps between checkpoints |
@@ -69,7 +72,12 @@ local/remote commit and update status.
 
 ## Datasets (auto-mixed, label-balanced)
 
-`0 = human`, `1 = AI`. Streamed with a per-source cap to stay light:
+`0 = human`, `1 = AI`. A **fair background harvester** round-robins all sources,
+pulling small paced chunks from each up to `DATASET_TARGET`, caching them to
+`/data/base_cache.jsonl` so the pool **grows across restarts** and **every**
+source is represented (not just the first few). Per-source progress is shown on
+the dashboard. If you see only a couple of sources fill up, set an `HF_TOKEN`
+secret — unauthenticated streaming gets rate-limited.
 
 * `alex-kudryashov/dlr-hw-2-human-ai-texts`
 * `nbroad/basic_text_dataset` (human)
