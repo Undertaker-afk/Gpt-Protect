@@ -47,6 +47,20 @@ class ModelConfig:
     # --- intelligent AI-pattern feature pathway (ai_patterns.py) --------- #
     use_pattern_features: bool = True  # fuse hand-engineered AI-detection feats
 
+    # --- backbone selection ---------------------------------------------- #
+    backbone: str = "scratch"          # "scratch" | "hf:<model-name>"  (#19)
+
+    # --- auxiliary heads / training objectives --------------------------- #
+    use_token_head: bool = True        # per-token human/AI head (#20)
+    token_loss_coef: float = 0.1
+    use_source_head: bool = False      # multi-task: predict dataset source (#21)
+    n_sources: int = 0
+    source_loss_coef: float = 0.2
+    contrastive_coef: float = 0.0      # SupCon on pooled embeddings (#22)
+    distill_coef: float = 0.0          # KD from a teacher (#30)
+    temperature_init: float = 1.0      # calibration temperature (#24)
+    abstain_margin: float = 0.12       # |p-0.5| below this -> "uncertain" (#24)
+
     # --- MoE -------------------------------------------------------------- #
     use_moe: bool = True
     moe_every: int = 2                 # every Nth block is an MoE block

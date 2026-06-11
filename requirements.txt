@@ -8,4 +8,5 @@ safetensors
 huggingface_hub
 scikit-learn
 pandas
+pyspellchecker
 gradio>=4.44

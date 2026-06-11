@@ -84,6 +84,14 @@ RESET_FLAG = os.path.join(DATA_DIR, "force_reset")     # git pull + hard reset
 NUKE_FLAG = os.path.join(DATA_DIR, "nuke")             # wipe repo + bucket + setup
 # admin password (Space secret). If unset, the admin panel refuses to operate.
 ADMIN_PWD = os.environ.get("PWD_ENV", "")
+# advanced objectives (default off on free CPU; flip on with more hardware)
+BACKBONE = os.environ.get("BACKBONE", "scratch")            # "hf:<name>" (#19)
+CONTRASTIVE_COEF = float(os.environ.get("CONTRASTIVE_COEF", "0"))   # (#22)
+DISTILL_TEACHER = os.environ.get("DISTILL_TEACHER", "")            # (#30) "hf:..."
+DISTILL_COEF = float(os.environ.get("DISTILL_COEF", "0.5"))
+ACTIVE_LEARNING = os.environ.get("ACTIVE_LEARNING", "1") == "1"     # (#26)
+CALIBRATE_EVERY = int(os.environ.get("CALIBRATE_EVERY", "200"))     # (#24)
+ABSTAIN_MARGIN = float(os.environ.get("ABSTAIN_MARGIN", "0.12"))    # (#24)
 
 LABELS = {0: "HUMAN", 1: "AI-GENERATED"}
 
@@ -103,8 +111,14 @@ class RealtimeTrainer:
         self.pre = Preprocessor(max_chars=8000)
         self.aug = Augmenter(prob=0.3)
 
-        self.tok = get_tokenizer(os.environ.get("TOKENIZER", "gpt2"))
+        # tokenizer: matches the HF backbone when one is selected (#19)
+        tok_name = (BACKBONE.split("hf:", 1)[1] if BACKBONE.startswith("hf:")
+                    else os.environ.get("TOKENIZER", "gpt2"))
+        self.tok = get_tokenizer(tok_name)
         self.mcfg = preset(PRESET)
+        self.mcfg.backbone = BACKBONE
+        self.mcfg.contrastive_coef = CONTRASTIVE_COEF
+        self.mcfg.abstain_margin = ABSTAIN_MARGIN
         self.mcfg.max_seq_len = max(self.mcfg.max_seq_len, MAX_SEQ)
         vocab = len(self.tok) if hasattr(self.tok, "__len__") else \
             getattr(self.tok, "vocab_size", 50257)
@@ -115,15 +129,23 @@ class RealtimeTrainer:
         self.model.label_smoothing = 0.05
         self.tcfg = TrainConfig(optimizer=os.environ.get("OPTIMIZER", "muon"))
         self.opt = build_optimizer(self.model, self.tcfg)
+        self.teacher = self._load_teacher()      # KD teacher (#30), optional
 
+        # active-learning hard pool (#26): uncertain samples, oversampled
+        self.hard = {0: [], 1: []}
+        self._last_texts = []
         # shared, UI-visible state
         self.state = {
             "global_step": 0, "samples_seen": 0, "user_samples": 0,
             "loss_ema": None, "acc_ema": None, "best_acc": 0.0,
-            "steps_per_s": None,
+            "steps_per_s": None, "temperature": 1.0, "contrastive_ema": None,
             "cm": {"tp": 0, "tn": 0, "fp": 0, "fn": 0},
             "started_at": None, "last_save": 0, "status": "init",
-            "preset": PRESET, "params_M": round(self.model.num_parameters() / 1e6, 2),
+            "preset": PRESET, "backbone": BACKBONE,
+            "params_M": round(self.model.num_parameters() / 1e6, 2),
+            "n_features": __import__("ai_patterns").N_FEATURES,
+            "perplexity": __import__("perplexity").enabled(),
+            "teacher": bool(self.teacher),
             "device": self.device, "data_dir": DATA_DIR,
         }
         self._last_step_t = None
@@ -379,48 +401,135 @@ class RealtimeTrainer:
                 return b[self._rand_idx(len(b))], lbl
         return None
 
+    def _sample_label_AL(self, want):
+        """Like _sample_label but oversamples the active-learning hard pool."""
+        if ACTIVE_LEARNING and self.hard[want] and self._coin(0.35):
+            return self.hard[want][self._rand_idx(len(self.hard[want]))], want
+        return self._sample_label(want)
+
     def _make_batch(self):
         from ai_patterns import feature_vector
         items = []
         for i in range(BATCH):
-            picked = self._sample_label(i % 2)        # alternate human/ai
+            picked = self._sample_label_AL(i % 2)     # alternate human/ai
             if picked is None:
                 return None
             text, label = picked
-            text = self.aug(text)
+            text = self.aug(text)                     # adversarial aug (#23)
             feats = feature_vector(text)
             enc = self.tok(text, truncation=True, max_length=MAX_SEQ)
             ids = enc["input_ids"][:MAX_SEQ] or [self.pad_id]
-            items.append((ids, label, feats))
-        maxlen = max(len(i) for i, _, _ in items)
-        bx, bm, by, bf = [], [], [], []
-        for ids, label, feats in items:
+            items.append((ids, label, feats, text))
+        maxlen = max(len(it[0]) for it in items)
+        bx, bm, by, bf, bt = [], [], [], [], []
+        for ids, label, feats, text in items:
             pad = maxlen - len(ids)
             bx.append(ids + [self.pad_id] * pad)
             bm.append([1] * len(ids) + [0] * pad)
             by.append(label)
             bf.append(feats)
+            bt.append(text)
         return (torch.tensor(bx), torch.tensor(bm), torch.tensor(by),
-                torch.tensor(bf, dtype=torch.float))
+                torch.tensor(bf, dtype=torch.float), bt)
+
+    def _mine_hard(self, ids, labels, feats, probs):
+        """Active learning (#26): keep the most-uncertain samples for replay."""
+        if not ACTIVE_LEARNING:
+            return
+        conf = probs.max(-1).values
+        for i, c in enumerate(conf.tolist()):
+            if c < 0.65:                              # uncertain
+                lbl = int(labels[i].item())
+                txt = self._last_texts[i] if i < len(self._last_texts) else None
+                if txt:
+                    pool = self.hard[lbl]
+                    pool.append(txt)
+                    if len(pool) > 400:
+                        pool.pop(0)
+
+    @torch.no_grad()
+    def _calibrate(self):
+        """Temperature scaling (#24): fit log_temp on a held-out batch."""
+        b = self._make_batch()
+        if b is None:
+            return
+        ids, mask, labels, feats, _ = b
+        self.model.eval()
+        logits = self.model(ids.to(self.device), mask.to(self.device),
+                            pattern_feats=feats.to(self.device))["logits"].detach()
+        labels = labels.to(self.device)
+        tp = self.model.log_temp
+        tp.requires_grad_(True)
+        opt = torch.optim.LBFGS([tp], lr=0.1, max_iter=20)
+
+        def closure():
+            opt.zero_grad()
+            loss = torch.nn.functional.cross_entropy(
+                logits / tp.exp().clamp(0.3, 5.0), labels)
+            loss.backward()
+            return loss
+        try:
+            opt.step(closure)
+        except Exception:
+            pass
+        self.model.train()
+        self.state["temperature"] = round(float(self.model.temperature), 3)
+
+    # ----- teacher / objectives ---------------------------------------- #
+    def _load_teacher(self):
+        if not DISTILL_TEACHER:
+            return None
+        try:
+            from config import preset as _preset
+            tcfg = _preset(PRESET)
+            tcfg.backbone = DISTILL_TEACHER
+            tcfg.vocab_size = self.mcfg.vocab_size
+            teacher = build_model(tcfg).to(self.device).eval()
+            for p in teacher.parameters():
+                p.requires_grad_(False)
+            self._log(f"distillation teacher loaded: {DISTILL_TEACHER}")
+            return teacher
+        except Exception as e:
+            self._log(f"teacher load failed: {repr(e)[:90]}")
+            return None
 
     # ----- training loop ------------------------------------------------ #
     def _train_step(self):
         batch = self._make_batch()
         if batch is None:
             return False
-        ids, mask, labels, feats = (t.to(self.device) for t in batch)
+        ids, mask, labels, feats, texts = batch
+        self._last_texts = texts
+        ids = ids.to(self.device); mask = mask.to(self.device)
+        labels = labels.to(self.device); feats = feats.to(self.device)
         self.model.train()
         out = self.model(ids, mask, labels, pattern_feats=feats)
         loss = out["loss"]
+        closs = None
+        if CONTRASTIVE_COEF > 0:                                # SupCon (#22)
+            from model import supcon_loss
+            closs = supcon_loss(out["embedding"], labels)
+            loss = loss + CONTRASTIVE_COEF * closs
+        if self.teacher is not None:                           # distill (#30)
+            from model import distill_loss
+            with torch.no_grad():
+                t_logits = self.teacher(ids, mask, pattern_feats=feats)["logits"]
+            loss = loss + DISTILL_COEF * distill_loss(out["logits"], t_logits)
         self.opt.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
         self.opt.step()
 
         with torch.no_grad():
-            preds = out["logits"].argmax(-1)
+            probs = torch.softmax(out["logits"], -1)
+            preds = probs.argmax(-1)
             acc = (preds == labels).float().mean().item()
+            self._mine_hard(ids, labels, feats, probs)          # active learn (#26)
         l = float(loss.item())
+        if closs is not None:
+            cv = float(closs.item())
+            self.state["contrastive_ema"] = cv if self.state["contrastive_ema"] is None \
+                else 0.98 * self.state["contrastive_ema"] + 0.02 * cv
         now = time.time()
         with self.lock:
             self.state["global_step"] += 1
@@ -463,11 +572,14 @@ class RealtimeTrainer:
                     time.sleep(2.0)
                     continue
                 self.state["status"] = "training"
+                if CALIBRATE_EVERY and self.state["global_step"] % CALIBRATE_EVERY == 0:
+                    self._calibrate()               # temperature scaling (#24)
                 if self.state["global_step"] % SAVE_EVERY == 0:
                     self._save_ckpt()
                     self._log(f"step {self.state['global_step']} "
                               f"loss={self.state['loss_ema']:.4f} "
-                              f"acc={self.state['acc_ema']:.3f} (checkpoint saved)")
+                              f"acc={self.state['acc_ema']:.3f} "
+                              f"T={self.state['temperature']} (checkpoint saved)")
             except Exception as e:
                 self._log(f"train error: {e}")
                 traceback.print_exc()
@@ -629,22 +741,86 @@ class RealtimeTrainer:
         return self.model.predict_proba(x, m, pattern_feats=ft)[:, 1].tolist()
 
     @torch.no_grad()
+    def _token_heatmap(self, text):
+        """Per-token AI heatmap from the token head (#20)."""
+        if not getattr(self.model, "use_token_head", False):
+            return None
+        from ai_patterns import feature_vector
+        try:
+            enc = self.tok(text, truncation=True, max_length=MAX_SEQ,
+                           return_offsets_mapping=True)
+        except Exception:
+            return None
+        ids = enc["input_ids"][:MAX_SEQ] or [self.pad_id]
+        offs = enc.get("offset_mapping", [])[:len(ids)]
+        x = torch.tensor([ids], device=self.device)
+        m = torch.ones_like(x)
+        ft = torch.tensor([feature_vector(text)], dtype=torch.float,
+                          device=self.device)
+        tp = self.model.token_ai_probs(x, m, pattern_feats=ft)
+        if tp is None:
+            return None
+        tp = tp[0].tolist()
+        spans, pos = [], 0
+        for (a, b), p in zip(offs, tp):
+            if a is None or b is None or b <= a:
+                continue
+            if a > pos:
+                spans.append((text[pos:a], None))
+            bucket = ("AI-token" if p >= 0.6 else
+                      "human-token" if p <= 0.4 else "mixed-token")
+            spans.append((text[a:b], bucket))
+            pos = b
+        if pos < len(text):
+            spans.append((text[pos:], None))
+        return spans or None
+
+    @torch.no_grad()
     def predict(self, text: str):
         from ai_patterns import (feature_vector, heuristic_ai_score, top_signals,
                                  sentence_list, find_ai_tells, extract_features,
-                                 tell_spans)
+                                 tell_spans, grouped_report)
+        import perplexity
         text = self.pre(text)
         if not text:
             return None, {}, {}
-        prob = self._model_probs([text])
+        prob = self._model_probs([text])           # calibrated (#24)
         ai_prob = prob[0] if prob else 0.5
+        heur = heuristic_ai_score(text)
+        ppl = perplexity.analysis(text)            # (#1,#2) zeros if disabled
+        ppl_prob = perplexity.ai_probability(text)
+
+        # ensemble of available signals
+        sig = [(ai_prob, 0.5), (heur, 0.3)]
+        if ppl_prob is not None:
+            sig.append((ppl_prob, 0.25))
+        wsum = sum(w for _, w in sig)
+        ensemble = sum(p * w for p, w in sig) / wsum
         full = [1 - ai_prob, ai_prob]
+
+        # calibrated verdict + abstention (#24)
+        if abs(ensemble - 0.5) < ABSTAIN_MARGIN:
+            verdict = "UNCERTAIN"
+        else:
+            verdict = LABELS[int(ensemble >= 0.5)]
+
         explain = {
-            "neural_ai_prob": round(ai_prob, 4),
-            "heuristic_ai_score": round(heuristic_ai_score(text), 4),
-            "top_signals": top_signals(text, 6),
+            "verdict": verdict,
+            "ensemble_ai_prob": round(ensemble, 4),
+            "neural_ai_prob (calibrated)": round(ai_prob, 4),
+            "heuristic_ai_score": round(heur, 4),
+            "perplexity_ai_prob": (round(ppl_prob, 4) if ppl_prob is not None
+                                   else "disabled (USE_PERPLEXITY=1)"),
+            "calibration_temperature": self.state.get("temperature", 1.0),
+            "top_signals": top_signals(text, 8),
             "stylometry": stylometric_features(text),
         }
+        stats_report = grouped_report(text)
+        if ppl.get("enabled"):
+            stats_report["perplexity / DetectGPT (#1,#2)"] = {
+                k: ppl[k] for k in ("perplexity", "mean_nll", "frac_top10",
+                                    "frac_top100", "detectgpt_curvature")}
+        token_heat = self._token_heatmap(text)
 
         # ---- per-sentence / phrase breakdown (stats + model) ----------- #
         sents = sentence_list(text)
@@ -678,6 +854,10 @@ class RealtimeTrainer:
         breakdown = {
             "analyzed_text": text,
             "highlighted": highlighted,
+            "token_highlighted": token_heat,
+            "stats_report": stats_report,
+            "verdict": verdict,
+            "ensemble": ensemble,
             "rows": rows,
             "columns": ["#", "words", "chars", "avg word len", "long words",
                         "AI-tell words", "stats AI%", "model AI%", "verdict"],
@@ -697,27 +877,36 @@ def build_ui(trainer: RealtimeTrainer):
         columns=["#", "words", "chars", "avg word len", "long words",
                  "AI-tell words", "stats AI%", "model AI%", "verdict"])
 
+    def _blank(msg):
+        return ({"HUMAN": 0.0, "AI-GENERATED": 0.0}, [(msg, None)],
+                [(msg, None)], _EMPTY_TBL, {}, {}, msg)
+
     def analyze(text):
         if not text or not text.strip():
-            return ({"HUMAN": 0.0, "AI-GENERATED": 0.0}, [("Enter some text.", None)],
-                    _EMPTY_TBL, {}, "Enter some text.")
+            return _blank("Enter some text.")
         prob, explain, breakdown = trainer.predict(text)
         if prob is None:
-            return ({"HUMAN": 0.0, "AI-GENERATED": 0.0}, [("Empty after cleaning.", None)],
-                    _EMPTY_TBL, {}, "Empty after cleaning.")
-        verdict = LABELS[int(prob[1] >= 0.5)]
-        conf = max(prob) * 100
+            return _blank("Empty after cleaning.")
+        verdict = breakdown["verdict"]
+        ens = breakdown["ensemble"]
         h = explain["heuristic_ai_score"]
-        agree = "✅ agree" if (h >= 0.5) == (prob[1] >= 0.5) else "⚠️ disagree"
+        ppl = explain["perplexity_ai_prob"]
+        emoji = {"HUMAN": "✍️", "AI-GENERATED": "🤖", "UNCERTAIN": "🤔"}[verdict]
         tops = ", ".join(t["signal"] for t in explain["top_signals"][:3])
-        note = (f"**{verdict}** · {conf:.1f}% confidence · "
-                f"neural AI-prob {prob[1]:.2f} vs heuristic {h:.2f} ({agree})  \n"
-                f"top AI signals: _{tops}_  \n"
-                f"{len(breakdown['rows'])} sentences analyzed · model step "
+        note = (f"## {emoji} {verdict}\n"
+                f"**Ensemble AI-probability: {ens*100:.1f}%** "
+                f"(neural {prob[1]:.2f} · heuristic {h:.2f}"
+                + (f" · perplexity {ppl:.2f}" if isinstance(ppl, float) else "")
+                + f" · calibration T={explain['calibration_temperature']})  \n"
+                f"top signals: _{tops}_  \n"
+                f"{len(breakdown['rows'])} sentences · model step "
                 f"{trainer.state['global_step']} (acc≈{(trainer.state['acc_ema'] or 0):.2f})")
-        heat = breakdown["highlighted"]
+        sent_heat = breakdown["highlighted"]
+        tok_heat = breakdown["token_highlighted"] or [
+            ("token-level head unavailable", None)]
         tbl = pd.DataFrame(breakdown["rows"], columns=breakdown["columns"])
-        return {"HUMAN": prob[0], "AI-GENERATED": prob[1]}, heat, tbl, explain, note
+        return ({"HUMAN": prob[0], "AI-GENERATED": prob[1]}, sent_heat, tok_heat,
+                tbl, breakdown["stats_report"], explain, note)
 
     def feedback(text, lbl):
         if not text or not text.strip():
@@ -838,19 +1027,30 @@ def build_ui(trainer: RealtimeTrainer):
                     explain = gr.JSON(label="AI-pattern analysis (neural + heuristic)")
             gr.Markdown("### 🔦 Analyzed text — sentence AI-heatmap")
             gr.Markdown("Red = AI-leaning · amber = mixed · green = human-leaning "
-                        "(blend of statistics + model).")
+                        "(blend of statistics + model); **purple = AI-tell words**.")
             heat = gr.HighlightedText(
-                label="What was detected (sentence color + AI-tell words)",
+                label="Sentence color + AI-tell words",
                 combine_adjacent=False, show_legend=True,
                 color_map={"AI-leaning": "#ef4444", "mixed": "#f59e0b",
                            "human-leaning": "#22c55e", "AI-tell": "#9333ea"})
+            gr.Markdown("### 🧠 Token-level model heatmap (per-token AI head, #20)")
+            tok_heat = gr.HighlightedText(
+                label="What the neural token-head flagged, token by token",
+                combine_adjacent=True, show_legend=True,
+                color_map={"AI-token": "#ef4444", "mixed-token": "#f59e0b",
+                           "human-token": "#22c55e"})
             gr.Markdown("### 📋 Per-sentence / phrase breakdown")
             table = gr.Dataframe(
                 headers=["#", "words", "chars", "avg word len", "long words",
                          "AI-tell words", "stats AI%", "model AI%", "verdict"],
                 label="Phrase length & what statistics / the model flagged",
                 wrap=True, interactive=False)
-            btn.click(analyze, inp, [out, heat, table, explain, note])
+            gr.Markdown("### 📊 Full statistics breakdown (all detected features)")
+            stats_json = gr.JSON(label="Grouped feature report "
+                                       "(burstiness, diversity, readability, "
+                                       "sentiment, perplexity, …)")
+            btn.click(analyze, inp,
+                      [out, heat, tok_heat, table, stats_json, explain, note])
             b_h.click(lambda t: feedback(t, 0), inp, fb)
             b_a.click(lambda t: feedback(t, 1), inp, fb)
 

@@ -125,10 +125,15 @@ def main():
     train_loader, val_loader, pad_id = build_loaders(tr_ds, va_ds, tokenizer, tcfg)
 
     # --- model --------------------------------------------------------- #
+    # enable the multi-task source head (#21): we know each row's dataset
+    from dataset import N_SOURCES
+    mcfg.use_source_head = True
+    mcfg.n_sources = N_SOURCES
     model = build_model(mcfg).to(device)
     model.label_smoothing = tcfg.label_smoothing
     n_params = model.num_parameters()
     print(f"[model] actual params = {n_params/1e6:.1f}M ({n_params/1e9:.3f}B)")
+    from model import supcon_loss
 
     opt = build_optimizer(model, tcfg)
     steps_per_epoch = max(len(train_loader) // tcfg.grad_accum, 1)
@@ -153,8 +158,14 @@ def main():
             labels = batch["labels"].to(device)
             feats = batch.get("pattern_feats")
             feats = feats.to(device) if feats is not None else None
-            out = model(ids, mask, labels, pattern_feats=feats)
-            loss = out["loss"] / tcfg.grad_accum
+            src = batch.get("sources")
+            src = src.to(device) if src is not None else None
+            out = model(ids, mask, labels, pattern_feats=feats, source_labels=src)
+            loss = out["loss"]
+            if mcfg.contrastive_coef > 0:           # SupCon (#22)
+                loss = loss + mcfg.contrastive_coef * supcon_loss(
+                    out["embedding"], labels)
+            loss = loss / tcfg.grad_accum
             loss.backward()
 
             if (it + 1) % tcfg.grad_accum == 0:

@@ -59,6 +59,7 @@ class TextClsDataset(TorchDataset):
             "input_ids": torch.tensor(enc["input_ids"], dtype=torch.long),
             "attention_mask": torch.tensor(enc["attention_mask"], dtype=torch.long),
             "label": torch.tensor(int(row["label"]), dtype=torch.long),
+            "source": torch.tensor(int(row.get("source", 0)), dtype=torch.long),
             "pattern_feats": torch.tensor(feature_vector(text), dtype=torch.float),
         }
 
@@ -77,6 +78,7 @@ def make_collate(pad_id: int):
             "input_ids": torch.stack(ids),
             "attention_mask": torch.stack(masks),
             "labels": torch.stack(labels),
+            "sources": torch.stack([b["source"] for b in batch]),
             "pattern_feats": torch.stack([b["pattern_feats"] for b in batch]),
         }
     return collate

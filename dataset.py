@@ -54,6 +54,11 @@ DATASET_SPECS = [
 ]
 
 
+SOURCE_NAMES = [s["name"] for s in DATASET_SPECS]
+SOURCE_INDEX = {n: i for i, n in enumerate(SOURCE_NAMES)}
+N_SOURCES = len(SOURCE_NAMES)
+
+
 def _norm_label(v) -> Optional[int]:
     if v is None:
         return None
@@ -147,8 +152,10 @@ def load_human_ai(max_samples: Optional[int] = None,
 
     texts, labels = [], []
     counts = {}
+    sources = []
     for spec in specs:
         name = spec["name"]
+        sidx = SOURCE_INDEX.get(name, 0)
         got = 0
         try:
             for t, lbl in _iter_spec(spec, per_dataset):
@@ -158,6 +165,7 @@ def load_human_ai(max_samples: Optional[int] = None,
                     continue
                 texts.append(t)
                 labels.append(int(lbl))
+                sources.append(sidx)
                 got += 1
             counts[name] = got
             print(f"[dataset] {name}: {got} rows")
@@ -168,7 +176,7 @@ def load_human_ai(max_samples: Optional[int] = None,
     if not texts:
         raise RuntimeError("No datasets could be loaded (check network/HF).")
 
-    ds = Dataset.from_dict({"text": texts, "label": labels})
+    ds = Dataset.from_dict({"text": texts, "label": labels, "source": sources})
     ds = ds.shuffle(seed=seed)
     if max_samples:
         ds = ds.select(range(min(max_samples, len(ds))))

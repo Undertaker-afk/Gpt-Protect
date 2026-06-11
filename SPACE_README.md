@@ -105,10 +105,30 @@ secret — unauthenticated streaming gets rate-limited.
   **confusion** bar charts, a recent-events log (auto-refresh every 3 s), and a
   **"Check GitHub for update now"** button that forces an immediate update check.
 
-The model has an **intelligent AI-pattern engine** (`ai_patterns.py`) fused into
-it — 24 signals (burstiness, perplexity proxy, repetition, AI-tell lexicon, …) —
-so detection is strong even early in training. The detect heatmap also paints
-**individual AI-tell words** (purple) on top of the per-sentence coloring.
+The model has an **intelligent AI-pattern engine** (`ai_patterns.py`, ~59
+signals) fused into it, plus an optional **reference-LM perplexity / DetectGPT**
+module (`perplexity.py`). The Detect tab shows: the calibrated **ensemble
+verdict** (neural + heuristic + perplexity, with an *Uncertain* abstain band), a
+**sentence heatmap** with purple AI-tell words, a **token-level model heatmap**
+(per-token AI head), the **per-sentence table**, and a **full grouped statistics
+report** (burstiness, diversity, readability, sentiment, perplexity, …).
+
+### Advanced features & flags
+
+| Feature | Flag | Notes |
+|---|---|---|
+| Perplexity + DetectGPT (#1,#2) | `USE_PERPLEXITY=1` | loads `PPL_MODEL` (default distilgpt2); also feeds the model (#29) |
+| Pretrained backbone (#19) | `BACKBONE=hf:<name>` | e.g. `hf:distilroberta-base`; tokenizer auto-matches |
+| Token-level head (#20) | on by default | per-token AI heatmap + weak token loss |
+| Multi-task source head (#21) | auto in `train.py` | predicts which dataset a sample came from |
+| Contrastive SupCon (#22) | `CONTRASTIVE_COEF=0.2` | pulls same-label embeddings together |
+| Adversarial augmentation (#23) | on by default | label-preserving evasion-style augments |
+| Calibration + abstain (#24) | `CALIBRATE_EVERY`, `ABSTAIN_MARGIN` | temperature scaling + Uncertain band |
+| Active learning (#26) | `ACTIVE_LEARNING=1` | oversamples the most-uncertain samples |
+| Distillation (#30) | `DISTILL_TEACHER=hf:<name>` | KD from a stronger teacher |
+
+All heavy options are **off by default** so the free CPU Space stays fast; the
+24 statistical features are always on.
 
 * **🛠️ Admin** — password-gated (Space secret `PWD_ENV`). Actions:
   * **Delete local models** — remove checkpoints + reinitialize weights.
