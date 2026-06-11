@@ -78,8 +78,12 @@ TRAIN_ENABLED = os.environ.get("TRAIN", "1") == "1"
 # how long the SIGTERM handler waits for the training thread to finish a step
 UPDATE_GRACE_MARGIN = int(os.environ.get("UPDATE_GRACE_MARGIN", "30"))
 UPDATER_STATUS_PATH = os.path.join(DATA_DIR, "updater.json")
-# touch-file the dashboard writes to ask the app.py supervisor to check now
+# touch-files the UI writes for the app.py supervisor to act on
 FORCE_UPDATE_FLAG = os.path.join(DATA_DIR, "force_update")
+RESET_FLAG = os.path.join(DATA_DIR, "force_reset")     # git pull + hard reset
+NUKE_FLAG = os.path.join(DATA_DIR, "nuke")             # wipe repo + bucket + setup
+# admin password (Space secret). If unset, the admin panel refuses to operate.
+ADMIN_PWD = os.environ.get("PWD_ENV", "")
 
 LABELS = {0: "HUMAN", 1: "AI-GENERATED"}
 
@@ -144,6 +148,7 @@ class RealtimeTrainer:
         self.state["user_samples"] = len(self.user_data)
 
         self._stop = threading.Event()
+        self._pause = threading.Event()          # admin can pause the train loop
         self.thread = None
         self.harvest_thread = None
 
@@ -448,6 +453,10 @@ class RealtimeTrainer:
         self._log("realtime training started")
         while not self._stop.is_set():
             try:
+                if self._pause.is_set():
+                    self.state["status"] = "paused (admin)"
+                    time.sleep(0.25)
+                    continue
                 ok = self._train_step()
                 if not ok:
                     self.state["status"] = "waiting for data"
@@ -486,6 +495,115 @@ class RealtimeTrainer:
     def stop(self):
         self._stop.set()
 
+    # ----- admin operations -------------------------------------------- #
+    def admin_enabled(self):
+        return bool(ADMIN_PWD)
+
+    def _auth(self, pwd):
+        if not ADMIN_PWD:
+            return False, "🔒 Admin disabled: set the `PWD_ENV` secret on the Space."
+        if pwd != ADMIN_PWD:
+            return False, "❌ Wrong password."
+        return True, ""
+
+    def _pause_for_admin(self):
+        """Park the training loop at the pause check so we can mutate safely."""
+        self._pause.set()
+        time.sleep(3.0)                      # let any in-flight step finish
+
+    def _resume_after_admin(self):
+        self._pause.clear()
+
+    def _rm(self, path):
+        import shutil
+        try:
+            if os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+            elif os.path.exists(path):
+                os.remove(path)
+        except Exception as e:
+            self._log(f"rm {path}: {e}")
+
+    def _reinit_model(self):
+        self.model = build_model(self.mcfg).to(self.device)
+        self.model.label_smoothing = 0.05
+        self.opt = build_optimizer(self.model, self.tcfg)
+        self.state.update(global_step=0, samples_seen=0, loss_ema=None,
+                          acc_ema=None, best_acc=0.0, steps_per_s=None,
+                          last_save=0, cm={"tp": 0, "tn": 0, "fp": 0, "fn": 0})
+        self.loss_hist.clear()
+        self.acc_hist.clear()
+        self._last_step_t = None
+
+    def admin_delete_models(self, pwd):
+        ok, msg = self._auth(pwd)
+        if not ok:
+            return msg
+        self._pause_for_admin()
+        try:
+            self._rm(CKPT_DIR)
+            os.makedirs(CKPT_DIR, exist_ok=True)
+            self._rm(STATE_PATH)
+            self._reinit_model()
+            self._log("ADMIN: deleted local models + reinitialized weights")
+        finally:
+            self._resume_after_admin()
+        return "🗑️ Local models deleted and weights reinitialized (step reset to 0)."
+
+    def admin_reset_everything(self, pwd):
+        ok, msg = self._auth(pwd)
+        if not ok:
+            return msg
+        self._pause_for_admin()
+        try:
+            for p in (CKPT_DIR, STATE_PATH, COLLECTED_PATH, BASE_CACHE_PATH,
+                      LOG_PATH, UPDATER_STATUS_PATH):
+                self._rm(p)
+            os.makedirs(CKPT_DIR, exist_ok=True)
+            # wipe in-memory state
+            self.base = {0: [], 1: []}
+            self.user = {0: [], 1: []}
+            self.user_data = []
+            self.source_counts = {}
+            self._seen_base = set()
+            self._harvest_iters = {}
+            self.log_lines.clear()
+            self._reinit_model()
+            self.state["user_samples"] = 0
+            self._seed_base()                 # re-seed so training resumes
+            self._log("ADMIN: full reset (models, state, collected, base cache)")
+        finally:
+            self._resume_after_admin()
+        return ("♻️ Reset everything: models, training state, collected samples "
+                "and base cache cleared; datasets re-seeding. Repo/code untouched.")
+
+    def admin_request_reset(self, pwd):
+        ok, msg = self._auth(pwd)
+        if not ok:
+            return msg
+        try:
+            with open(RESET_FLAG, "w") as f:
+                f.write(str(time.time()))
+        except Exception as e:
+            return f"Could not request repull: {e}"
+        self._log("ADMIN: repull+reset requested")
+        return ("⤵️ Repull & reset requested — supervisor will `git fetch` + hard-"
+                "reset to remote, reinstall, and restart (≤30 s). /data is kept.")
+
+    def admin_request_nuke(self, pwd):
+        ok, msg = self._auth(pwd)
+        if not ok:
+            return msg
+        try:
+            with open(NUKE_FLAG, "w") as f:
+                f.write(str(time.time()))
+        except Exception as e:
+            return f"Could not arm NUKE: {e}"
+        self._log("ADMIN: ☢️ NUKE armed")
+        return ("☢️ **NUKE armed.** Supervisor will delete the local repo, every "
+                "checkpoint and every file in the bucket, then re-clone and set "
+                "everything up again (≤30 s). This cannot be undone.")
+
     # ----- inference ---------------------------------------------------- #
     @torch.no_grad()
     def _model_probs(self, texts):
@@ -513,7 +631,8 @@ class RealtimeTrainer:
     @torch.no_grad()
     def predict(self, text: str):
         from ai_patterns import (feature_vector, heuristic_ai_score, top_signals,
-                                 sentence_list, find_ai_tells, extract_features)
+                                 sentence_list, find_ai_tells, extract_features,
+                                 tell_spans)
         text = self.pre(text)
         if not text:
             return None, {}, {}
@@ -539,7 +658,9 @@ class RealtimeTrainer:
             tells = find_ai_tells(s)
             bucket = ("AI-leaning" if blend >= 0.6
                       else "human-leaning" if blend <= 0.4 else "mixed")
-            highlighted.append((s + " ", bucket))
+            # sentence-level color + word-level AI-tell highlights on top
+            highlighted.extend(tell_spans(s, bucket))
+            highlighted.append((" ", bucket))
             long_words = sum(1 for w in s.split() if len(w) >= 8)
             rows.append([
                 i + 1,
@@ -719,10 +840,10 @@ def build_ui(trainer: RealtimeTrainer):
             gr.Markdown("Red = AI-leaning · amber = mixed · green = human-leaning "
                         "(blend of statistics + model).")
             heat = gr.HighlightedText(
-                label="What was detected (per sentence)",
+                label="What was detected (sentence color + AI-tell words)",
                 combine_adjacent=False, show_legend=True,
                 color_map={"AI-leaning": "#ef4444", "mixed": "#f59e0b",
-                           "human-leaning": "#22c55e"})
+                           "human-leaning": "#22c55e", "AI-tell": "#9333ea"})
             gr.Markdown("### 📋 Per-sentence / phrase breakdown")
             table = gr.Dataframe(
                 headers=["#", "words", "chars", "avg word len", "long words",
@@ -762,6 +883,40 @@ def build_ui(trainer: RealtimeTrainer):
             timer.tick(dashboard, None, outs)
             demo.load(dashboard, None, outs)
             upd_btn.click(force_update_now, None, upd_msg)
+
+        with gr.Tab("🛠️ Admin"):
+            gr.Markdown(
+                "## 🛠️ Admin panel\n"
+                "Enter the admin password (Space secret `PWD_ENV`) to operate. "
+                "Every action re-checks the password.")
+            adm_pwd = gr.Textbox(label="Admin password", type="password",
+                                 placeholder="PWD_ENV")
+            adm_status = gr.Markdown()
+            if not trainer.admin_enabled():
+                gr.Markdown("⚠️ `PWD_ENV` is not set on this Space — the admin "
+                            "panel is **disabled** until you add that secret.")
+            with gr.Row():
+                a_del = gr.Button("🗑️ Delete local models")
+                a_reset = gr.Button("♻️ Reset everything (data + model)")
+                a_pull = gr.Button("⤵️ Repull & reset (code)")
+            gr.Markdown("---\n### ☢️ Danger zone")
+            gr.Markdown(
+                "**NUKE** deletes the local GitHub repo, **all** checkpoints and "
+                "**every file in the mounted bucket**, then re-clones and sets "
+                "everything up again from scratch. There is no undo.")
+            nuke_confirm = gr.Textbox(
+                label="Type NUKE to confirm", placeholder="NUKE")
+            a_nuke = gr.Button("☢️ NUKE EVERYTHING", variant="stop")
+
+            a_del.click(trainer.admin_delete_models, adm_pwd, adm_status)
+            a_reset.click(trainer.admin_reset_everything, adm_pwd, adm_status)
+            a_pull.click(trainer.admin_request_reset, adm_pwd, adm_status)
+
+            def _nuke(pwd, confirm):
+                if confirm.strip() != "NUKE":
+                    return "Type **NUKE** in the confirm box to proceed."
+                return trainer.admin_request_nuke(pwd)
+            a_nuke.click(_nuke, [adm_pwd, nuke_confirm], adm_status)
 
     return demo
 

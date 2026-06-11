@@ -164,6 +164,41 @@ def find_ai_tells(text: str):
     return hits
 
 
+def tell_spans(sentence: str, bucket: str):
+    """Split a sentence into (chunk, label) spans, tagging AI-tell phrases with
+    the 'AI-tell' category and the rest with the sentence's bucket — used to
+    paint individual AI-tell words on top of the sentence-level heatmap."""
+    low = sentence.lower()
+    matches = []
+    for p in AI_TELLS:
+        start = 0
+        while True:
+            i = low.find(p, start)
+            if i < 0:
+                break
+            # require word-ish boundaries so "realm of" etc. match cleanly
+            matches.append((i, i + len(p)))
+            start = i + len(p)
+    if not matches:
+        return [(sentence, bucket)]
+    matches.sort()
+    merged = []
+    for s, e in matches:
+        if merged and s <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+    spans, pos = [], 0
+    for s, e in merged:
+        if s > pos:
+            spans.append((sentence[pos:s], bucket))
+        spans.append((sentence[s:e], "AI-tell"))
+        pos = e
+    if pos < len(sentence):
+        spans.append((sentence[pos:], bucket))
+    return spans
+
+
 def sentence_list(text: str, max_sentences: int = 80):
     """Split into sentences, keeping trailing punctuation, capped for cost."""
     text = text or ""

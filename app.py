@@ -44,8 +44,10 @@ SUPERVISE_TICK = int(os.environ.get("SUPERVISE_TICK_SEC", "30"))
 REQS_HASH_FILE = os.path.join(_BASE, ".gptp_reqs_hash")
 _STATUS_DIR = _DATA if os.path.isdir(_DATA) else _BASE
 STATUS_FILE = os.path.join(_STATUS_DIR, "updater.json")
-# the UI ("Check for update now" button) touches this file to force a check
+# flags the UI / admin panel touch for the supervisor to act on
 FORCE_FLAG = os.path.join(_STATUS_DIR, "force_update")
+RESET_FLAG = os.path.join(_STATUS_DIR, "force_reset")
+NUKE_FLAG = os.path.join(_STATUS_DIR, "nuke")
 
 
 def log(msg):
@@ -161,6 +163,45 @@ def graceful_stop(proc):
         pass
 
 
+def _reexec():
+    log("re-exec supervisor")
+    os.execv(sys.executable,
+             [sys.executable, os.path.abspath(__file__)] + sys.argv[1:])
+
+
+def do_reset(proc):
+    """Repull & hard-reset code to remote, reinstall, restart (admin)."""
+    log("ADMIN repull+reset: pausing main.py")
+    graceful_stop(proc)
+    git_pull()
+    install_requirements()
+    _reexec()
+
+
+def do_nuke(proc):
+    """Delete the repo + every file in the bucket, re-clone, set up again."""
+    import shutil
+    log("ADMIN ☢️ NUKE: pausing main.py")
+    graceful_stop(proc)
+    # wipe the repo
+    shutil.rmtree(REPO_DIR, ignore_errors=True)
+    # wipe every entry in the bucket (but keep the mount point itself)
+    if os.path.isdir(_STATUS_DIR):
+        for entry in os.listdir(_STATUS_DIR):
+            p = os.path.join(_STATUS_DIR, entry)
+            if os.path.isdir(p):
+                shutil.rmtree(p, ignore_errors=True)
+            else:
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+    log("NUKE: bucket + repo wiped; re-cloning")
+    ensure_repo()
+    install_requirements(force=True)
+    _reexec()
+
+
 def supervise():
     proc = launch_main()
     last_check = time.time()
@@ -174,6 +215,22 @@ def supervise():
         if proc.poll() is not None:
             log(f"main.py exited rc={proc.returncode}; relaunching")
             proc = launch_main()
+
+        # admin: NUKE (wipe everything) — highest priority
+        if os.path.exists(NUKE_FLAG):
+            try:
+                os.remove(NUKE_FLAG)
+            except Exception:
+                pass
+            do_nuke(proc)          # never returns (re-exec)
+
+        # admin: repull + hard reset
+        if os.path.exists(RESET_FLAG):
+            try:
+                os.remove(RESET_FLAG)
+            except Exception:
+                pass
+            do_reset(proc)         # never returns (re-exec)
 
         # forced update check (UI button touches FORCE_FLAG)
         forced = False
