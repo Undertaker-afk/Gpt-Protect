@@ -60,6 +60,13 @@ one labeled stream (`0=human, 1=ai`):
 Add more by appending to `DATASET_SPECS`. The corpus is human-heavy, so the
 realtime trainer samples **label-balanced** batches.
 
+On the Space these are pulled by a **fair background harvester** (`main.py`):
+it round-robins all sources, fetching small paced chunks from each up to
+`DATASET_TARGET`, and caches them to `/data/base_cache.jsonl` so the pool grows
+across restarts and **every** source is represented equally — not just the first
+couple (which is what happens if unauthenticated streaming gets rate-limited; set
+an `HF_TOKEN` secret to avoid that). The dashboard shows per-source progress.
+
 ## Train
 
 ```bash
@@ -87,7 +94,10 @@ use `MODEL_PRESET=tiny`.
 ### UI
 * **🔍 Detect** — paste text → HUMAN/AI verdict, confidence, **neural vs. heuristic
   AI-score agreement**, top contributing AI signals, and a full pattern/stylometry
-  breakdown; label it to train the model live.
+  breakdown; label it to train the model live. The analyzed text is rendered as a
+  **sentence-level AI heatmap** (red/amber/green) plus a **per-sentence/phrase table**
+  (word & char counts, avg word length, long-word count, the AI-tell words found, and
+  both the **statistics AI%** and the **model AI%** for every sentence).
 * **📈 Dashboard** — live step / loss / accuracy / throughput / precision-recall-F1,
   **loss & accuracy curves**, **training-pool composition** and **confusion tallies**
   bar charts, plus a **"Check GitHub for update now"** button (forces the auto-updater

@@ -60,16 +60,25 @@ local/remote commit and update status.
 | `UPDATE_GRACE_SEC` | `150` | seconds allowed for checkpoint-before-restart |
 | `MODEL_PRESET` | `tiny` | `tiny` fits free CPU+16GB; `0.4b`/`5b` need big HW |
 | `DATA_DIR` | `/data` | persistent bucket mount |
-| `BASE_SAMPLES` | `4000` | public-dataset rows mixed into training |
-| `DATASET_PER_CAP` | auto | max rows streamed per source dataset |
+| `DATASET_TARGET` | `1500` | per-source in-memory sample target (harvester) |
+| `SEED_PER_SOURCE` | `25` | rows pulled synchronously per source at startup |
+| `HARVEST_CHUNK` | `40` | rows fetched per source per round-robin round |
+| `HARVEST_PACE_SEC` | `0.4` | delay between fetches (dodges HF rate limits) |
+| `HF_TOKEN` | — | **set this as a secret** for higher HF rate limits |
 | `MAX_SEQ_LEN` | `192` | tokens per sample |
 | `BATCH_SIZE` | `8` | realtime training batch |
 | `SAVE_EVERY` | `25` | steps between checkpoints |
 | `TRAIN` | `1` | set `0` to serve inference only |
+| `PWD_ENV` | — | **admin-panel password** (required to use the Admin tab) |
 
 ## Datasets (auto-mixed, label-balanced)
 
-`0 = human`, `1 = AI`. Streamed with a per-source cap to stay light:
+`0 = human`, `1 = AI`. A **fair background harvester** round-robins all sources,
+pulling small paced chunks from each up to `DATASET_TARGET`, caching them to
+`/data/base_cache.jsonl` so the pool **grows across restarts** and **every**
+source is represented (not just the first few). Per-source progress is shown on
+the dashboard. If you see only a couple of sources fill up, set an `HF_TOKEN`
+secret — unauthenticated streaming gets rate-limited.
 
 * `alex-kudryashov/dlr-hw-2-human-ai-texts`
 * `nbroad/basic_text_dataset` (human)
@@ -84,8 +93,13 @@ local/remote commit and update status.
 
 * **🔍 Detect** — paste text → HUMAN/AI verdict, confidence, the **neural vs.
   heuristic AI-score** (and whether they agree), the **top AI signals**, and a
-  full pattern/stylometry breakdown. Use the *HUMAN* / *AI* buttons to label the
-  sample; it is saved to `/data/collected.jsonl` and folded into training at once.
+  full pattern/stylometry breakdown. The analyzed text is shown as a
+  **sentence-level AI heatmap** (red = AI-leaning, amber = mixed, green =
+  human-leaning) with a **per-sentence/phrase table** — phrase length, char
+  count, avg word length, long-word count, the AI-tell words detected, and both
+  the **statistics AI%** and the **model AI%** for each sentence. Use the
+  *HUMAN* / *AI* buttons to label the sample; it is saved to
+  `/data/collected.jsonl` and folded into training at once.
 * **📈 Training dashboard** — live step / loss / accuracy / throughput /
   precision-recall-F1, **loss & accuracy curves**, **pool-composition** and
   **confusion** bar charts, a recent-events log (auto-refresh every 3 s), and a
@@ -93,7 +107,18 @@ local/remote commit and update status.
 
 The model has an **intelligent AI-pattern engine** (`ai_patterns.py`) fused into
 it — 24 signals (burstiness, perplexity proxy, repetition, AI-tell lexicon, …) —
-so detection is strong even early in training.
+so detection is strong even early in training. The detect heatmap also paints
+**individual AI-tell words** (purple) on top of the per-sentence coloring.
+
+* **🛠️ Admin** — password-gated (Space secret `PWD_ENV`). Actions:
+  * **Delete local models** — remove checkpoints + reinitialize weights.
+  * **Reset everything** — wipe models, training state, collected samples and the
+    base-data cache, then re-seed (code untouched).
+  * **Repull & reset** — `git fetch` + hard-reset code to remote, reinstall,
+    restart (supervisor handles it; /data kept).
+  * **☢️ NUKE** — delete the local repo, every checkpoint and **every file in the
+    bucket**, then re-clone and set everything up from scratch (type `NUKE` to
+    confirm). No undo.
 
 ## Persistence layout (`/data`)
 

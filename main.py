@@ -61,18 +61,29 @@ CKPT_PATH = os.path.join(CKPT_DIR, "last.pt")
 STATE_PATH = os.path.join(DATA_DIR, "state.json")
 COLLECTED_PATH = os.path.join(DATA_DIR, "collected.jsonl")
 LOG_PATH = os.path.join(DATA_DIR, "train_log.jsonl")
+BASE_CACHE_PATH = os.path.join(DATA_DIR, "base_cache.jsonl")
 
 PRESET = os.environ.get("MODEL_PRESET", "tiny")        # free CPU -> tiny
 MAX_SEQ = int(os.environ.get("MAX_SEQ_LEN", "192"))
 BATCH = int(os.environ.get("BATCH_SIZE", "8"))
 BASE_SAMPLES = int(os.environ.get("BASE_SAMPLES", "4000"))
+# incremental harvester: per-source in-memory target, synchronous seed per
+# source, round-robin chunk size, and a pacing delay to dodge HF rate limits.
+DATASET_TARGET = int(os.environ.get("DATASET_TARGET", "1500"))
+SEED_PER_SOURCE = int(os.environ.get("SEED_PER_SOURCE", "25"))
+HARVEST_CHUNK = int(os.environ.get("HARVEST_CHUNK", "40"))
+HARVEST_PACE_SEC = float(os.environ.get("HARVEST_PACE_SEC", "0.4"))
 SAVE_EVERY = int(os.environ.get("SAVE_EVERY", "25"))   # steps between ckpts
 TRAIN_ENABLED = os.environ.get("TRAIN", "1") == "1"
 # how long the SIGTERM handler waits for the training thread to finish a step
 UPDATE_GRACE_MARGIN = int(os.environ.get("UPDATE_GRACE_MARGIN", "30"))
 UPDATER_STATUS_PATH = os.path.join(DATA_DIR, "updater.json")
-# touch-file the dashboard writes to ask the app.py supervisor to check now
+# touch-files the UI writes for the app.py supervisor to act on
 FORCE_UPDATE_FLAG = os.path.join(DATA_DIR, "force_update")
+RESET_FLAG = os.path.join(DATA_DIR, "force_reset")     # git pull + hard reset
+NUKE_FLAG = os.path.join(DATA_DIR, "nuke")             # wipe repo + bucket + setup
+# admin password (Space secret). If unset, the admin panel refuses to operate.
+ADMIN_PWD = os.environ.get("PWD_ENV", "")
 
 LABELS = {0: "HUMAN", 1: "AI-GENERATED"}
 
@@ -128,12 +139,18 @@ class RealtimeTrainer:
         self.base = {0: [], 1: []}
         self.user = {0: [], 1: []}
         self.user_data = []                      # canonical list (count/persist)
-        self._load_base_data()
+        self.source_counts = {}                  # per-dataset in-memory tally
+        self._seen_base = set()                  # de-dup hashes for base cache
+        self._harvest_iters = {}                 # persistent per-source streams
+        self._load_base_cache()                  # instant: grows across restarts
+        self._seed_base()                        # quick balanced seed if needed
         self._load_collected()
         self.state["user_samples"] = len(self.user_data)
 
         self._stop = threading.Event()
+        self._pause = threading.Event()          # admin can pause the train loop
         self.thread = None
+        self.harvest_thread = None
 
     # ----- persistence ------------------------------------------------- #
     def _log(self, msg):
@@ -204,23 +221,123 @@ class RealtimeTrainer:
             except Exception as e:
                 self._log(f"collected load failed: {e}")
 
-    def _load_base_data(self):
-        """Load a capped slice of the public datasets for continual training."""
+    # ----- base dataset harvesting (incremental + cached + fair) -------- #
+    def _add_base(self, name, text, label, persist=True):
+        """Add one base sample to the pools (deduped) and optionally cache it."""
+        text = self.pre(text)
+        if not text:
+            return False
+        if self.source_counts.get(name, 0) >= DATASET_TARGET:
+            return False
+        h = hash((label, text[:160]))
+        if h in self._seen_base:
+            return False
+        self._seen_base.add(h)
+        with self.lock:
+            self.base[label].append(text)
+        self.source_counts[name] = self.source_counts.get(name, 0) + 1
+        if persist:
+            try:
+                with open(BASE_CACHE_PATH, "a") as f:
+                    f.write(json.dumps({"n": name, "text": text,
+                                        "label": int(label)}) + "\n")
+            except Exception:
+                pass
+        return True
+
+    def _load_base_cache(self):
+        """Reload previously-harvested base samples from /data (fast, offline)."""
+        if not os.path.exists(BASE_CACHE_PATH):
+            return
+        n = 0
         try:
-            from dataset import load_human_ai, DATASET_SPECS
-            # stream only ~enough per source to fill BASE_SAMPLES after shuffle,
-            # so startup stays light on a 2-vCPU / 16 GB Space.
-            n_specs = max(1, len(DATASET_SPECS))
-            per = int(os.environ.get(
-                "DATASET_PER_CAP", str(max(200, (BASE_SAMPLES // n_specs) * 2))))
-            ds = load_human_ai(max_samples=BASE_SAMPLES, per_dataset=per,
-                               preprocess=True)
-            for r in ds:
-                self.base[int(r["label"])].append(r["text"])
-            self._log(f"base dataset: human={len(self.base[0])}, "
-                      f"ai={len(self.base[1])}")
+            with open(BASE_CACHE_PATH) as f:
+                for line in f:
+                    try:
+                        r = json.loads(line)
+                    except Exception:
+                        continue
+                    name, text, lbl = r.get("n"), r.get("text"), r.get("label")
+                    if text and lbl in (0, 1):
+                        if self._add_base(name or "?", text, int(lbl), persist=False):
+                            n += 1
+            self._log(f"base cache: {n} samples across "
+                      f"{len(self.source_counts)} sources")
         except Exception as e:
-            self._log(f"base data unavailable ({e}); training on user data only")
+            self._log(f"base cache load failed: {e}")
+
+    def _seed_base(self):
+        """Synchronously pull a small balanced seed from each source so training
+        can start immediately and fairly, even on a cold (empty-cache) start."""
+        try:
+            from dataset import DATASET_SPECS, open_stream
+        except Exception as e:
+            self._log(f"dataset module unavailable: {e}")
+            return
+        for spec in DATASET_SPECS:
+            name = spec["name"]
+            if self.source_counts.get(name, 0) >= SEED_PER_SOURCE:
+                continue
+            got = 0
+            try:
+                it = open_stream(spec)
+                self._harvest_iters[name] = it
+                for text, lbl in it:
+                    if self._add_base(name, text, lbl):
+                        got += 1
+                    if got >= SEED_PER_SOURCE:
+                        break
+            except Exception as e:
+                self._log(f"seed {name}: {repr(e)[:80]}")
+        self._log(f"seed done: human={len(self.base[0])} ai={len(self.base[1])} "
+                  f"sources={sum(1 for v in self.source_counts.values() if v)}")
+
+    def _harvest_loop(self):
+        """Background round-robin harvester: keeps topping up every source to
+        DATASET_TARGET, paced to dodge rate limits, retrying on error, caching
+        to /data so the pool grows monotonically across restarts."""
+        try:
+            from dataset import DATASET_SPECS, open_stream
+        except Exception:
+            return
+        self._log("base harvester started")
+        while not self._stop.is_set():
+            progressed = False
+            for spec in DATASET_SPECS:
+                if self._stop.is_set():
+                    break
+                name = spec["name"]
+                if self.source_counts.get(name, 0) >= DATASET_TARGET:
+                    continue
+                try:
+                    it = self._harvest_iters.get(name)
+                    if it is None:
+                        it = open_stream(spec)
+                        self._harvest_iters[name] = it
+                    got = 0
+                    exhausted = True
+                    for text, lbl in it:
+                        if self._add_base(name, text, lbl):
+                            got += 1
+                            progressed = True
+                        if got >= HARVEST_CHUNK or \
+                                self.source_counts.get(name, 0) >= DATASET_TARGET:
+                            exhausted = False
+                            break
+                    if exhausted:               # stream ended -> recreate later
+                        self._harvest_iters[name] = None
+                except Exception as e:
+                    self._log(f"harvest {name}: {repr(e)[:70]}")
+                    self._harvest_iters[name] = None
+                    time.sleep(2.0)
+                time.sleep(HARVEST_PACE_SEC)    # gentle pacing
+            if all(self.source_counts.get(s["name"], 0) >= DATASET_TARGET
+                   for s in DATASET_SPECS):
+                self._log("base harvest complete: all sources at target")
+                break
+            if not progressed:
+                time.sleep(15.0)
+        self.state["base_total"] = len(self.base[0]) + len(self.base[1])
 
     # ----- data submission --------------------------------------------- #
     def add_sample(self, text: str, label: int):
@@ -336,6 +453,10 @@ class RealtimeTrainer:
         self._log("realtime training started")
         while not self._stop.is_set():
             try:
+                if self._pause.is_set():
+                    self.state["status"] = "paused (admin)"
+                    time.sleep(0.25)
+                    continue
                 ok = self._train_step()
                 if not ok:
                     self.state["status"] = "waiting for data"
@@ -356,40 +477,212 @@ class RealtimeTrainer:
         self._log("training loop stopped")
 
     def start(self):
+        # background base-data harvester runs regardless of TRAIN so all 8
+        # sources keep filling up (and caching) even in inference-only mode.
+        self._stop.clear()
+        if not (self.harvest_thread and self.harvest_thread.is_alive()):
+            self.harvest_thread = threading.Thread(target=self._harvest_loop,
+                                                   daemon=True)
+            self.harvest_thread.start()
         if not TRAIN_ENABLED:
             self.state["status"] = "training disabled (TRAIN=0)"
             return
         if self.thread and self.thread.is_alive():
             return
-        self._stop.clear()
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
 
     def stop(self):
         self._stop.set()
 
+    # ----- admin operations -------------------------------------------- #
+    def admin_enabled(self):
+        return bool(ADMIN_PWD)
+
+    def _auth(self, pwd):
+        if not ADMIN_PWD:
+            return False, "🔒 Admin disabled: set the `PWD_ENV` secret on the Space."
+        if pwd != ADMIN_PWD:
+            return False, "❌ Wrong password."
+        return True, ""
+
+    def _pause_for_admin(self):
+        """Park the training loop at the pause check so we can mutate safely."""
+        self._pause.set()
+        time.sleep(3.0)                      # let any in-flight step finish
+
+    def _resume_after_admin(self):
+        self._pause.clear()
+
+    def _rm(self, path):
+        import shutil
+        try:
+            if os.path.isdir(path):
+                shutil.rmtree(path, ignore_errors=True)
+            elif os.path.exists(path):
+                os.remove(path)
+        except Exception as e:
+            self._log(f"rm {path}: {e}")
+
+    def _reinit_model(self):
+        self.model = build_model(self.mcfg).to(self.device)
+        self.model.label_smoothing = 0.05
+        self.opt = build_optimizer(self.model, self.tcfg)
+        self.state.update(global_step=0, samples_seen=0, loss_ema=None,
+                          acc_ema=None, best_acc=0.0, steps_per_s=None,
+                          last_save=0, cm={"tp": 0, "tn": 0, "fp": 0, "fn": 0})
+        self.loss_hist.clear()
+        self.acc_hist.clear()
+        self._last_step_t = None
+
+    def admin_delete_models(self, pwd):
+        ok, msg = self._auth(pwd)
+        if not ok:
+            return msg
+        self._pause_for_admin()
+        try:
+            self._rm(CKPT_DIR)
+            os.makedirs(CKPT_DIR, exist_ok=True)
+            self._rm(STATE_PATH)
+            self._reinit_model()
+            self._log("ADMIN: deleted local models + reinitialized weights")
+        finally:
+            self._resume_after_admin()
+        return "🗑️ Local models deleted and weights reinitialized (step reset to 0)."
+
+    def admin_reset_everything(self, pwd):
+        ok, msg = self._auth(pwd)
+        if not ok:
+            return msg
+        self._pause_for_admin()
+        try:
+            for p in (CKPT_DIR, STATE_PATH, COLLECTED_PATH, BASE_CACHE_PATH,
+                      LOG_PATH, UPDATER_STATUS_PATH):
+                self._rm(p)
+            os.makedirs(CKPT_DIR, exist_ok=True)
+            # wipe in-memory state
+            self.base = {0: [], 1: []}
+            self.user = {0: [], 1: []}
+            self.user_data = []
+            self.source_counts = {}
+            self._seen_base = set()
+            self._harvest_iters = {}
+            self.log_lines.clear()
+            self._reinit_model()
+            self.state["user_samples"] = 0
+            self._seed_base()                 # re-seed so training resumes
+            self._log("ADMIN: full reset (models, state, collected, base cache)")
+        finally:
+            self._resume_after_admin()
+        return ("♻️ Reset everything: models, training state, collected samples "
+                "and base cache cleared; datasets re-seeding. Repo/code untouched.")
+
+    def admin_request_reset(self, pwd):
+        ok, msg = self._auth(pwd)
+        if not ok:
+            return msg
+        try:
+            with open(RESET_FLAG, "w") as f:
+                f.write(str(time.time()))
+        except Exception as e:
+            return f"Could not request repull: {e}"
+        self._log("ADMIN: repull+reset requested")
+        return ("⤵️ Repull & reset requested — supervisor will `git fetch` + hard-"
+                "reset to remote, reinstall, and restart (≤30 s). /data is kept.")
+
+    def admin_request_nuke(self, pwd):
+        ok, msg = self._auth(pwd)
+        if not ok:
+            return msg
+        try:
+            with open(NUKE_FLAG, "w") as f:
+                f.write(str(time.time()))
+        except Exception as e:
+            return f"Could not arm NUKE: {e}"
+        self._log("ADMIN: ☢️ NUKE armed")
+        return ("☢️ **NUKE armed.** Supervisor will delete the local repo, every "
+                "checkpoint and every file in the bucket, then re-clone and set "
+                "everything up again (≤30 s). This cannot be undone.")
+
     # ----- inference ---------------------------------------------------- #
     @torch.no_grad()
+    def _model_probs(self, texts):
+        """Batched neural AI-probability for a list of texts."""
+        from ai_patterns import feature_vector
+        if not texts:
+            return []
+        encs, feats = [], []
+        for t in texts:
+            e = self.tok(t, truncation=True, max_length=MAX_SEQ)["input_ids"]
+            encs.append(e[:MAX_SEQ] or [self.pad_id])
+            feats.append(feature_vector(t))
+        maxlen = max(len(e) for e in encs)
+        bx, bm = [], []
+        for e in encs:
+            pad = maxlen - len(e)
+            bx.append(e + [self.pad_id] * pad)
+            bm.append([1] * len(e) + [0] * pad)
+        x = torch.tensor(bx, device=self.device)
+        m = torch.tensor(bm, device=self.device)
+        ft = torch.tensor(feats, dtype=torch.float, device=self.device)
+        self.model.eval()
+        return self.model.predict_proba(x, m, pattern_feats=ft)[:, 1].tolist()
+
+    @torch.no_grad()
     def predict(self, text: str):
-        from ai_patterns import feature_vector, heuristic_ai_score, top_signals
+        from ai_patterns import (feature_vector, heuristic_ai_score, top_signals,
+                                 sentence_list, find_ai_tells, extract_features,
+                                 tell_spans)
         text = self.pre(text)
         if not text:
             return None, {}, {}
-        feats = torch.tensor([feature_vector(text)], dtype=torch.float,
-                             device=self.device)
-        enc = self.tok(text, truncation=True, max_length=MAX_SEQ)
-        ids = enc["input_ids"][:MAX_SEQ] or [self.pad_id]
-        x = torch.tensor([ids], device=self.device)
-        m = torch.ones_like(x)
-        self.model.eval()
-        prob = self.model.predict_proba(x, m, pattern_feats=feats)[0].tolist()
+        prob = self._model_probs([text])
+        ai_prob = prob[0] if prob else 0.5
+        full = [1 - ai_prob, ai_prob]
         explain = {
-            "neural_ai_prob": round(prob[1], 4),
+            "neural_ai_prob": round(ai_prob, 4),
             "heuristic_ai_score": round(heuristic_ai_score(text), 4),
             "top_signals": top_signals(text, 6),
             "stylometry": stylometric_features(text),
         }
-        return prob, explain, stylometric_features(text)
+
+        # ---- per-sentence / phrase breakdown (stats + model) ----------- #
+        sents = sentence_list(text)
+        sent_model = self._model_probs(sents) if sents else []
+        highlighted, rows = [], []
+        for i, s in enumerate(sents):
+            f = extract_features(s)
+            heur = heuristic_ai_score(s)
+            mdl = sent_model[i] if i < len(sent_model) else ai_prob
+            blend = 0.5 * heur + 0.5 * mdl
+            tells = find_ai_tells(s)
+            bucket = ("AI-leaning" if blend >= 0.6
+                      else "human-leaning" if blend <= 0.4 else "mixed")
+            # sentence-level color + word-level AI-tell highlights on top
+            highlighted.extend(tell_spans(s, bucket))
+            highlighted.append((" ", bucket))
+            long_words = sum(1 for w in s.split() if len(w) >= 8)
+            rows.append([
+                i + 1,
+                len(s.split()),
+                len(s),
+                round(f["avg_word_len"], 2),
+                long_words,
+                ", ".join(tells) if tells else "—",
+                f"{int(round(heur*100))}%",
+                f"{int(round(mdl*100))}%",
+                bucket,
+            ])
+        if not highlighted:
+            highlighted = [(text, "mixed")]
+        breakdown = {
+            "analyzed_text": text,
+            "highlighted": highlighted,
+            "rows": rows,
+            "columns": ["#", "words", "chars", "avg word len", "long words",
+                        "AI-tell words", "stats AI%", "model AI%", "verdict"],
+        }
+        return full, explain, breakdown
 
 
 # --------------------------------------------------------------------------- #
@@ -400,12 +693,18 @@ def build_ui(trainer: RealtimeTrainer):
 
     import pandas as pd
 
+    _EMPTY_TBL = pd.DataFrame(
+        columns=["#", "words", "chars", "avg word len", "long words",
+                 "AI-tell words", "stats AI%", "model AI%", "verdict"])
+
     def analyze(text):
         if not text or not text.strip():
-            return {"HUMAN": 0.0, "AI-GENERATED": 0.0}, {}, "Enter some text."
-        prob, explain, _ = trainer.predict(text)
+            return ({"HUMAN": 0.0, "AI-GENERATED": 0.0}, [("Enter some text.", None)],
+                    _EMPTY_TBL, {}, "Enter some text.")
+        prob, explain, breakdown = trainer.predict(text)
         if prob is None:
-            return {"HUMAN": 0.0, "AI-GENERATED": 0.0}, {}, "Empty after cleaning."
+            return ({"HUMAN": 0.0, "AI-GENERATED": 0.0}, [("Empty after cleaning.", None)],
+                    _EMPTY_TBL, {}, "Empty after cleaning.")
         verdict = LABELS[int(prob[1] >= 0.5)]
         conf = max(prob) * 100
         h = explain["heuristic_ai_score"]
@@ -414,9 +713,11 @@ def build_ui(trainer: RealtimeTrainer):
         note = (f"**{verdict}** · {conf:.1f}% confidence · "
                 f"neural AI-prob {prob[1]:.2f} vs heuristic {h:.2f} ({agree})  \n"
                 f"top AI signals: _{tops}_  \n"
-                f"model step {trainer.state['global_step']} "
-                f"(acc≈{(trainer.state['acc_ema'] or 0):.2f})")
-        return {"HUMAN": prob[0], "AI-GENERATED": prob[1]}, explain, note
+                f"{len(breakdown['rows'])} sentences analyzed · model step "
+                f"{trainer.state['global_step']} (acc≈{(trainer.state['acc_ema'] or 0):.2f})")
+        heat = breakdown["highlighted"]
+        tbl = pd.DataFrame(breakdown["rows"], columns=breakdown["columns"])
+        return {"HUMAN": prob[0], "AI-GENERATED": prob[1]}, heat, tbl, explain, note
 
     def feedback(text, lbl):
         if not text or not text.strip():
@@ -495,8 +796,18 @@ def build_ui(trainer: RealtimeTrainer):
             "cell": ["TP (ai✓)", "TN (human✓)", "FP (human→ai)", "FN (ai→human)"],
             "count": [cm["tp"], cm["tn"], cm["fp"], cm["fn"]],
         })
+        # per-source harvest progress (short names) toward DATASET_TARGET
+        sc = trainer.source_counts
+        src_df = pd.DataFrame({
+            "source": [n.split("/")[-1][:22] for n in sc],
+            "samples": [sc[n] for n in sc],
+        }) if sc else pd.DataFrame({"source": [], "samples": []})
+        done = sum(1 for v in sc.values() if v >= DATASET_TARGET)
+        md += (f"| base pool | {len(trainer.base[0])+len(trainer.base[1])} "
+               f"(human {len(trainer.base[0])} / ai {len(trainer.base[1])}) |\n"
+               f"| dataset sources | {len(sc)} active · {done}/{len(sc)} at target |\n")
         logs = "\n".join(list(trainer.log_lines)[-16:])
-        return md, loss_df, acc_df, dist_df, cm_df, logs
+        return md, loss_df, acc_df, dist_df, cm_df, src_df, logs
 
     try:
         _theme = gr.themes.Soft()
@@ -525,7 +836,21 @@ def build_ui(trainer: RealtimeTrainer):
                 with gr.Column(scale=2):
                     out = gr.Label(label="Prediction", num_top_classes=2)
                     explain = gr.JSON(label="AI-pattern analysis (neural + heuristic)")
-            btn.click(analyze, inp, [out, explain, note])
+            gr.Markdown("### 🔦 Analyzed text — sentence AI-heatmap")
+            gr.Markdown("Red = AI-leaning · amber = mixed · green = human-leaning "
+                        "(blend of statistics + model).")
+            heat = gr.HighlightedText(
+                label="What was detected (sentence color + AI-tell words)",
+                combine_adjacent=False, show_legend=True,
+                color_map={"AI-leaning": "#ef4444", "mixed": "#f59e0b",
+                           "human-leaning": "#22c55e", "AI-tell": "#9333ea"})
+            gr.Markdown("### 📋 Per-sentence / phrase breakdown")
+            table = gr.Dataframe(
+                headers=["#", "words", "chars", "avg word len", "long words",
+                         "AI-tell words", "stats AI%", "model AI%", "verdict"],
+                label="Phrase length & what statistics / the model flagged",
+                wrap=True, interactive=False)
+            btn.click(analyze, inp, [out, heat, table, explain, note])
             b_h.click(lambda t: feedback(t, 0), inp, fb)
             b_a.click(lambda t: feedback(t, 1), inp, fb)
 
@@ -547,13 +872,51 @@ def build_ui(trainer: RealtimeTrainer):
                 cm_plot = gr.BarPlot(x="cell", y="count",
                                      title="Confusion tallies (AI = positive)",
                                      height=240)
+            src_plot = gr.BarPlot(x="source", y="samples",
+                                  title="Samples harvested per dataset source",
+                                  height=260)
             logbox = gr.Textbox(label="Recent log", lines=12, interactive=False)
 
-            outs = [stats_md, loss_plot, acc_plot, dist_plot, cm_plot, logbox]
+            outs = [stats_md, loss_plot, acc_plot, dist_plot, cm_plot,
+                    src_plot, logbox]
             timer = gr.Timer(3.0)
             timer.tick(dashboard, None, outs)
             demo.load(dashboard, None, outs)
             upd_btn.click(force_update_now, None, upd_msg)
+
+        with gr.Tab("🛠️ Admin"):
+            gr.Markdown(
+                "## 🛠️ Admin panel\n"
+                "Enter the admin password (Space secret `PWD_ENV`) to operate. "
+                "Every action re-checks the password.")
+            adm_pwd = gr.Textbox(label="Admin password", type="password",
+                                 placeholder="PWD_ENV")
+            adm_status = gr.Markdown()
+            if not trainer.admin_enabled():
+                gr.Markdown("⚠️ `PWD_ENV` is not set on this Space — the admin "
+                            "panel is **disabled** until you add that secret.")
+            with gr.Row():
+                a_del = gr.Button("🗑️ Delete local models")
+                a_reset = gr.Button("♻️ Reset everything (data + model)")
+                a_pull = gr.Button("⤵️ Repull & reset (code)")
+            gr.Markdown("---\n### ☢️ Danger zone")
+            gr.Markdown(
+                "**NUKE** deletes the local GitHub repo, **all** checkpoints and "
+                "**every file in the mounted bucket**, then re-clones and sets "
+                "everything up again from scratch. There is no undo.")
+            nuke_confirm = gr.Textbox(
+                label="Type NUKE to confirm", placeholder="NUKE")
+            a_nuke = gr.Button("☢️ NUKE EVERYTHING", variant="stop")
+
+            a_del.click(trainer.admin_delete_models, adm_pwd, adm_status)
+            a_reset.click(trainer.admin_reset_everything, adm_pwd, adm_status)
+            a_pull.click(trainer.admin_request_reset, adm_pwd, adm_status)
+
+            def _nuke(pwd, confirm):
+                if confirm.strip() != "NUKE":
+                    return "Type **NUKE** in the confirm box to proceed."
+                return trainer.admin_request_nuke(pwd)
+            a_nuke.click(_nuke, [adm_pwd, nuke_confirm], adm_status)
 
     return demo
 
